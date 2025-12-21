@@ -9,10 +9,15 @@
 #include <algorithm>
 #include <random>
 #include <string>
-
+#include "core/parallax.h"
+#include "core/utils.h"
+#include "core/projectile.h"
+#include "player/bat.h"
+#include "collectables/coin.h"
+#include "core/sprite_anim.h"
 
 static SDL_Window *window = NULL;
-static SDL_Renderer *renderer = NULL;
+SDL_Renderer *renderer = NULL;
 static TTF_Font *font = nullptr;
 static SDL_Texture *textTex = nullptr;
 static SDL_Texture *bgTexture =  NULL;
@@ -23,9 +28,9 @@ static SDL_Texture *psTextureL4 = NULL;
 static SDL_Texture *psTextureL5 = NULL;
 static SDL_Texture *arrowTex = nullptr;
 static SDL_Texture *cursorTex = nullptr;
-static SDL_Texture *coinFrames[4] = {nullptr};
-static SDL_Texture *batMoveFrames[16] = {nullptr};
-static SDL_Texture *batDeathFrames[8] = {nullptr};
+SDL_Texture *coinFrames[4] = {nullptr};
+SDL_Texture *batMoveFrames[16] = {nullptr};
+SDL_Texture *batDeathFrames[8] = {nullptr};
 static SDL_Texture *warningFrames[9] = {nullptr};
 static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
@@ -41,31 +46,13 @@ static float pausedWaveFreq = 3.0f;  // Hz
 static float pausedWavePhaseStep = 0.6f;
 static bool wasEscapeDown = false;
 static bool playerDead = false;
-static const int kWinW = 480;
-static const int kWinH = 480;
 static const SDL_FColor kcolor = {1.0f, 0.0f, 1.0f, 1.0f};
 static const SDL_FColor koutline = {0.0f, 0.0f, 0.0f, 1.0f};
 
-static SDL_Texture *projectileFrames[30] = {nullptr}; // 1_0.png to 1_29.png
+SDL_Texture *projectileFrames[30] = {nullptr}; // 1_0.png to 1_29.png
 static bool wasMouseDown = false;
 
-static void GetLogicalMouse(float &lx, float &ly, Uint32 &buttons) {
-    float wx = 0.0f, wy = 0.0f;
-    buttons = SDL_GetMouseState(&wx, &wy);
-    if (!SDL_RenderCoordinatesFromWindow(renderer, wx, wy, &lx, &ly)) {
-        lx = wx;
-        ly = wy;
-    }
-}
 
-static void GetLogicalMouse(float &lx, float &ly) {
-    Uint32 dummy = 0;
-    GetLogicalMouse(lx, ly, dummy);
-}
-
-static float ClampF(float v, float lo, float hi) {
-    return (v < lo) ? lo : (v > hi) ? hi : v;
-}
 
 struct CachedText {
     SDL_Texture *tex = nullptr;
@@ -96,10 +83,6 @@ static void UpdateCachedText(CachedText &ct, const std::string &s, SDL_Color col
     SDL_DestroySurface(surf);
 }
 
-static bool AABBOverlap(const SDL_FRect &a, const SDL_FRect &b) {
-    return (a.x < b.x + b.w) && (a.x + a.w > b.x) &&
-           (a.y < b.y + b.h) && (a.y + a.h > b.y);
-}
 
 static void RenderLabel(const std::string &text, float x, float y) {
     if (!font || text.empty()) return;
@@ -162,98 +145,6 @@ enum class AnimState {
     Flying
 };
 
-struct SpriteAnim {
-    SDL_Texture *frames[6] = {nullptr};  // max frames among our sets
-    int frameCount = 0;
-    float frameTime = 0.1f;  // seconds per frame
-    float timer = 0.0f;
-    int index = 0;
-
-    void Init(float ft, int count) {
-        frameTime = ft;
-        frameCount = count;
-        timer = 0.0f;
-        index = 0;
-    }
-
-    void Reset() {
-        timer = 0.0f;
-        index = 0;
-    }
-
-    bool Update(float dt) {
-        if (frameCount <= 0) return false;
-        bool looped = false;
-        timer += dt;
-        while (timer >= frameTime) {
-            timer -= frameTime;
-            index = (index + 1) % frameCount;
-            if (index == 0) {
-                looped = true;  // completed a full cycle
-            }
-        }
-        return looped;
-    }
-
-    SDL_Texture* Current() const {
-        if (frameCount <= 0) return nullptr;
-        return frames[index];
-    }
-
-    void DestroyFrames() {
-        for (int i = 0; i < frameCount; ++i) {
-            if (frames[i]) {
-                SDL_DestroyTexture(frames[i]);
-                frames[i] = nullptr;
-            }
-        }
-        frameCount = 0;
-    }
-};
-
-struct Projectile {
-    SDL_FPoint pos;
-    SDL_FPoint vel;
-    float angle;
-    float timer;
-    int frame;
-    bool alive;
-
-    Projectile(float x, float y, float vx, float vy, float ang) 
-        : pos{x, y}, vel{vx, vy}, angle(ang), timer(0.0f), frame(0), alive(true) {}
-
-    void Update(float dt) {
-        if (!alive) return;
-        
-        pos.x += vel.x * dt;
-        pos.y += vel.y * dt;
-
-        // Animate through frames
-        timer += dt;
-        const float frameTime = 0.03f; // fast animation
-        while (timer >= frameTime) {
-            timer -= frameTime;
-            frame++;
-            if (frame >= 30) {
-                frame = 0; // loop animation
-            }
-        }
-
-        // Remove if off-screen
-        if (pos.x < -100 || pos.x > kWinW + 100 || pos.y < -100 || pos.y > kWinH + 100) {
-            alive = false;
-        }
-    }
-
-    void Render(SDL_Renderer *r) {
-        if (!alive || !projectileFrames[frame]) return;
-        
-        float w = 128.0f, h = 128.0f; // projectile size
-        SDL_FRect dst{pos.x - w * 0.5f, pos.y - h * 0.5f, w, h};
-        SDL_RenderTextureRotated(r, projectileFrames[frame], nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
-    }
-};
-
 struct DemoProjectile {
     SDL_FPoint pos;
     SDL_FPoint vel;
@@ -281,204 +172,6 @@ struct DemoProjectile {
         float w = 96.0f, h = 96.0f;
         SDL_FRect dst{pos.x - w * 0.5f, pos.y - h * 0.5f, w, h};
         SDL_RenderTextureRotated(r, projectileFrames[frame], nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
-    }
-};
-
-struct Coin {
-    SDL_FPoint pos;
-    float speed = 150.0f;   // px/s moving left
-    float timer = 0.0f;
-    int frame = 0;
-    bool alive = true;
-    float baseY = 0.0f;
-    float waveTime = 0.0f;
-    float waveAmp = 6.0f;
-    float waveFreq = 2.0f;
-    float wavePhase = 0.0f;
-
-    Coin(float x, float y, float s, float amp, float freq, float phase)
-        : pos{x, y}, speed{s}, baseY(y), waveAmp(amp), waveFreq(freq), wavePhase(phase) {}
-
-    void Update(float dt) {
-        if (!alive) return;
-        pos.x -= speed * dt;
-        waveTime += dt;
-        pos.y = baseY + SDL_sinf(waveTime * waveFreq + wavePhase) * waveAmp;
-
-        timer += dt;
-        const float frameTime = 0.12f;
-        while (timer >= frameTime) {
-            timer -= frameTime;
-            frame = (frame + 1) % 4;
-        }
-
-        if (pos.x < -40.0f) {
-            alive = false;
-        }
-    }
-
-    void Render(SDL_Renderer *r) {
-        if (!alive || !coinFrames[frame]) return;
-        float size = 32.0f;
-        SDL_FRect dst{pos.x - size * 0.5f, pos.y - size * 0.5f, size, size};
-        SDL_RenderTexture(r, coinFrames[frame], nullptr, &dst);
-    }
-};
-
-enum class BatState { Moving, Dying };
-struct Bat {
-    SDL_FPoint pos;
-    SDL_FPoint vel;
-    BatState state = BatState::Moving;
-    float animTimer = 0.0f;
-    int frame = 0;
-    float speed = 200.0f;
-    bool alive = true;
-    float deathTimer = 0.0f;
-    float bobTimer = 0.0f;
-    float hitFlash = 0.0f;
-    float trackTimer = 0.0f;
-
-    Bat(float x, float y, float spd) : pos{x, y}, vel{0.0f, 0.0f}, speed(spd) {}
-
-    void Update(float dt, const SDL_FPoint &target) {
-        if (!alive) return;
-        if (hitFlash > 0.0f) {
-            hitFlash -= dt;
-            if (hitFlash < 0.0f) hitFlash = 0.0f;
-        }
-        if (state == BatState::Moving) {
-            // simple seek
-            float dx = target.x - pos.x;
-            float dy = target.y - pos.y;
-            float len = SDL_sqrtf(dx*dx + dy*dy);
-            SDL_FPoint desired{0.0f, 0.0f};
-            if (len > 0.001f) {
-                desired.x = dx / len;
-                desired.y = dy / len;
-            }
-            // limited tracking window so player can dodge past
-            trackTimer += dt;
-            if (trackTimer < 1.2f) {
-                float steer = 0.6f; // partial follow
-                vel.x = vel.x * (1.0f - steer) + desired.x * speed * steer;
-                vel.y = vel.y * (1.0f - steer) + desired.y * speed * steer;
-            }
-            // normalize velocity to maintain speed
-            float vlen = SDL_sqrtf(vel.x*vel.x + vel.y*vel.y);
-            if (vlen > 0.001f) {
-                vel.x = vel.x / vlen * speed;
-                vel.y = vel.y / vlen * speed;
-            }
-            // bob adds variability
-            vel.y += SDL_sinf(bobTimer * 4.0f) * 30.0f;
-            pos.x += vel.x * dt;
-            pos.y += vel.y * dt;
-
-            // animate move
-            animTimer += dt;
-            const float ft = 0.06f;
-            while (animTimer >= ft) {
-                animTimer -= ft;
-                frame = (frame + 1) % 15;
-            }
-            bobTimer += dt;
-        } else {
-            // death animation advance
-            deathTimer += dt;
-            const float ft = 0.08f;
-            animTimer += dt;
-            while (animTimer >= ft) {
-                animTimer -= ft;
-                if (frame < 6) frame++;
-            }
-            if (frame >= 6 && deathTimer > 0.6f) {
-                alive = false;
-            }
-        }
-    }
-
-    void Kill() {
-        if (state == BatState::Moving) {
-            state = BatState::Dying;
-            frame = 0;
-            animTimer = 0.0f;
-            deathTimer = 0.0f;
-            hitFlash = 0.2f;
-        }
-    }
-
-    void Render(SDL_Renderer *r) {
-        if (!alive) return;
-        SDL_Texture *tex = nullptr;
-        if (state == BatState::Moving) {
-            tex = batMoveFrames[frame];
-        } else {
-            tex = batDeathFrames[frame];
-        }
-        if (!tex) return;
-        float w = 72.0f, h = 54.0f;
-        SDL_FRect dst{ pos.x - w * 0.5f, pos.y - h * 0.5f, w, h };
-        bool blink = (state == BatState::Dying) && ((SDL_GetTicks() / 80) % 2 == 0);
-        if (blink) {
-            SDL_SetTextureAlphaMod(tex, 140);
-        }
-        if (hitFlash > 0.0f) {
-            SDL_SetTextureColorMod(tex, 255, 220, 220);
-        }
-        SDL_RenderTexture(r, tex, nullptr, &dst);
-        if (hitFlash > 0.0f) {
-            SDL_SetTextureColorMod(tex, 255, 255, 255);
-        }
-        if (blink) {
-            SDL_SetTextureAlphaMod(tex, 255);
-        }
-    }
-
-    SDL_FRect Bounds() const {
-        float w = 64.0f, h = 46.0f;
-        return SDL_FRect{ pos.x - w * 0.5f, pos.y - h * 0.5f, w, h };
-    }
-};
-
-struct ParallaxLayer {
-    SDL_Texture *tex = nullptr;
-    float speed = 0.0f;
-    float y = 0.0f;
-    float x = 0.0f;
-    float texW = 0.0f;
-    float texH = 0.0f;
-
-    void SetTexture(SDL_Texture *t) {
-        tex = t;
-        float w = 0.0f, h = 0.0f;
-        if (tex && SDL_GetTextureSize(tex, &w, &h)) { // returns bool
-            texW = w;
-            texH = h;
-        }
-    }
-
-    void Update(float dt) {
-        if (!tex) return;
-        x -= speed * dt;
-        while (x <= -texW) x += texW;
-        while (x >= texW) x -= texW;
-    }
-
-    void SetSpeed(float s) { speed = s; }
-
-    void Render(SDL_Renderer *r, float viewportW) {
-        if (!tex) return;
-
-        // start one tile to the left of the screen
-        float start = x;
-        while (start > -texW) start -= texW;
-
-        // draw until we've covered the viewport plus one extra tile
-        for (float px = start; px < viewportW + texW; px += texW) {
-            SDL_FRect dst{ px, y, texW, texH };
-            SDL_RenderTexture(r, tex, nullptr, &dst);
-        }
     }
 };
 
@@ -780,27 +473,11 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     nearTrees.SetSpeed(120.0f);
 
     // Load player animations
-    runningAnim.Init(0.12f, 4);  // Running0-Running3
-    for (int i = 0; i < 4; ++i) {
-        char file[64];
-        SDL_snprintf(file, sizeof(file), "assets/Running/Running%d.png", i);
-        runningAnim.frames[i] = IMG_LoadTexture(renderer, file);
-        if (!runningAnim.frames[i]) {
-            SDL_Log("Failed to load running frame %d: %s", i, SDL_GetError());
-            return SDL_APP_FAILURE;
-        }
-    }
+    runningAnim.Init(0.12f, 4);
+    runningAnim.LoadFrames("assets/Running/Running", 4, renderer);
 
-    flyingAnim.Init(0.08f, 5);  // Flying0-Flying5
-    for (int i = 0; i < 5; ++i) {
-        char file[64];
-        SDL_snprintf(file, sizeof(file), "assets/Flying/Flying%d.png", i);
-        flyingAnim.frames[i] = IMG_LoadTexture(renderer, file);
-        if (!flyingAnim.frames[i]) {
-            SDL_Log("Failed to load flying frame %d: %s", i, SDL_GetError());
-            return SDL_APP_FAILURE;
-        }
-    }
+    flyingAnim.Init(0.08f, 5);
+    flyingAnim.LoadFrames("assets/Flying/Flying", 5, renderer);
 
 
     SDL_SetRenderLogicalPresentation(renderer, kWinW, kWinH, SDL_LOGICAL_PRESENTATION_LETTERBOX);
@@ -1210,15 +887,16 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             }
         }
 
-        // Projectile vs bats
         for (auto &p : projectiles) {
             if (!p.alive) continue;
-            SDL_FRect projBox{ p.pos.x - 10.0f, p.pos.y - 10.0f, 20.0f, 20.0f };
+            SDL_FRect projBox = p.Bounds();
             for (auto &b : bats) {
-                if (!b.alive || b.state == BatState::Dying) continue;
-                if (AABBOverlap(projBox, b.Bounds())) {
-                    p.alive = false;
+                if (!b.alive) continue;
+                SDL_FRect batBox = b.Bounds();
+                if (AABBOverlap(projBox, batBox)) {
                     b.Kill();
+                    p.alive = false;
+                    break; // projectile consumed
                 }
             }
         }
