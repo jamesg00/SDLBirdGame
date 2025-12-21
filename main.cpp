@@ -1,0 +1,1590 @@
+//Bird Game Concept 
+#define SDL_MAIN_USE_CALLBACKS 1 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#include <SDL3_image/SDL_image.h>
+#include <SDL3_ttf/SDL_ttf.h>
+#include <stdio.h>
+#include <vector>
+#include <algorithm>
+#include <random>
+#include <string>
+
+
+static SDL_Window *window = NULL;
+static SDL_Renderer *renderer = NULL;
+static TTF_Font *font = nullptr;
+static SDL_Texture *textTex = nullptr;
+static SDL_Texture *bgTexture =  NULL;
+static SDL_Texture *psTextureL1 = NULL;
+static SDL_Texture *psTextureL2 = NULL;
+static SDL_Texture *psTextureL3 = NULL;
+static SDL_Texture *psTextureL4 = NULL;
+static SDL_Texture *psTextureL5 = NULL;
+static SDL_Texture *arrowTex = nullptr;
+static SDL_Texture *cursorTex = nullptr;
+static SDL_Texture *coinFrames[4] = {nullptr};
+static SDL_Texture *batMoveFrames[16] = {nullptr};
+static SDL_Texture *batDeathFrames[8] = {nullptr};
+static SDL_Texture *warningFrames[9] = {nullptr};
+static int coinCount = 0;
+static float gameTimer = 0.0f; // seconds
+
+struct PausedLetter {
+    SDL_Texture *tex = nullptr;
+    float w = 0.0f;
+    float h = 0.0f;
+};
+static PausedLetter pausedLetters[6]; // "Paused"
+static float pausedWaveAmp = 12.0f;
+static float pausedWaveFreq = 3.0f;  // Hz
+static float pausedWavePhaseStep = 0.6f;
+static bool wasEscapeDown = false;
+static bool playerDead = false;
+static const int kWinW = 480;
+static const int kWinH = 480;
+static const SDL_FColor kcolor = {1.0f, 0.0f, 1.0f, 1.0f};
+static const SDL_FColor koutline = {0.0f, 0.0f, 0.0f, 1.0f};
+
+static SDL_Texture *projectileFrames[30] = {nullptr}; // 1_0.png to 1_29.png
+static bool wasMouseDown = false;
+
+static void GetLogicalMouse(float &lx, float &ly, Uint32 &buttons) {
+    float wx = 0.0f, wy = 0.0f;
+    buttons = SDL_GetMouseState(&wx, &wy);
+    if (!SDL_RenderCoordinatesFromWindow(renderer, wx, wy, &lx, &ly)) {
+        lx = wx;
+        ly = wy;
+    }
+}
+
+static void GetLogicalMouse(float &lx, float &ly) {
+    Uint32 dummy = 0;
+    GetLogicalMouse(lx, ly, dummy);
+}
+
+static float ClampF(float v, float lo, float hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+struct CachedText {
+    SDL_Texture *tex = nullptr;
+    float w = 0.0f;
+    float h = 0.0f;
+    std::string text;
+};
+
+static void DestroyCached(CachedText &ct) {
+    if (ct.tex) { SDL_DestroyTexture(ct.tex); ct.tex = nullptr; }
+    ct.w = ct.h = 0.0f;
+    ct.text.clear();
+}
+
+static void UpdateCachedText(CachedText &ct, const std::string &s, SDL_Color col) {
+    if (s == ct.text && ct.tex) return;
+    DestroyCached(ct);
+    if (!font) return;
+    SDL_Surface *surf = TTF_RenderText_Blended(font, s.c_str(), (int)s.size(), col);
+    if (!surf) return;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+    if (tex && SDL_GetTextureSize(tex, &ct.w, &ct.h)) {
+        ct.tex = tex;
+        ct.text = s;
+    } else {
+        if (tex) SDL_DestroyTexture(tex);
+    }
+    SDL_DestroySurface(surf);
+}
+
+static bool AABBOverlap(const SDL_FRect &a, const SDL_FRect &b) {
+    return (a.x < b.x + b.w) && (a.x + a.w > b.x) &&
+           (a.y < b.y + b.h) && (a.y + a.h > b.y);
+}
+
+static void RenderLabel(const std::string &text, float x, float y) {
+    if (!font || text.empty()) return;
+    SDL_Color white{255, 255, 255, 255};
+    SDL_Color shadow{0, 0, 0, 160};
+
+    auto makeTex = [&](SDL_Color col) -> SDL_Texture* {
+        SDL_Surface *surf = TTF_RenderText_Blended(font, text.c_str(), (int)text.size(), col);
+        if (!surf) return nullptr;
+        SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+        SDL_DestroySurface(surf);
+        return tex;
+    };
+
+    SDL_Texture *texShadow = makeTex(shadow);
+    SDL_Texture *texMain = makeTex(white);
+    float w = 0.0f, h = 0.0f;
+    if (texShadow && SDL_GetTextureSize(texShadow, &w, &h)) {
+        SDL_FRect dst1{ x + 2.0f, y + 2.0f, w, h };
+        SDL_FRect dst2{ x + 4.0f, y + 4.0f, w, h };
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst1);
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst2);
+    }
+    if (texMain && SDL_GetTextureSize(texMain, &w, &h)) {
+        SDL_FRect dst{ x, y, w, h };
+        SDL_RenderTexture(renderer, texMain, nullptr, &dst);
+    }
+    if (texShadow) SDL_DestroyTexture(texShadow);
+    if (texMain) SDL_DestroyTexture(texMain);
+}
+
+static bool LoadPausedLetters(SDL_Renderer *r, TTF_Font *f) {
+    const char *word = "Paused";
+    SDL_Color white{255, 255, 255, 255};
+    for (int i = 0; i < 6; ++i) {
+        char cstr[2] = {word[i], '\0'};
+        SDL_Surface *surf = TTF_RenderText_Blended(f, cstr, 1, white);
+        if (!surf) return false;
+        pausedLetters[i].tex = SDL_CreateTextureFromSurface(r, surf);
+        pausedLetters[i].w = (float)surf->w;
+        pausedLetters[i].h = (float)surf->h;
+        SDL_DestroySurface(surf);
+        if (!pausedLetters[i].tex) return false;
+    }
+    return true;
+}
+
+
+
+//keylistner
+struct InputState {
+    const bool* state = nullptr;
+    int count = 0;
+    void Update() { state = SDL_GetKeyboardState(&count); }
+    bool Down(SDL_Scancode sc) const { return state && state[sc]; }
+};
+
+enum class AnimState {
+    Running,
+    Flying
+};
+
+struct SpriteAnim {
+    SDL_Texture *frames[6] = {nullptr};  // max frames among our sets
+    int frameCount = 0;
+    float frameTime = 0.1f;  // seconds per frame
+    float timer = 0.0f;
+    int index = 0;
+
+    void Init(float ft, int count) {
+        frameTime = ft;
+        frameCount = count;
+        timer = 0.0f;
+        index = 0;
+    }
+
+    void Reset() {
+        timer = 0.0f;
+        index = 0;
+    }
+
+    bool Update(float dt) {
+        if (frameCount <= 0) return false;
+        bool looped = false;
+        timer += dt;
+        while (timer >= frameTime) {
+            timer -= frameTime;
+            index = (index + 1) % frameCount;
+            if (index == 0) {
+                looped = true;  // completed a full cycle
+            }
+        }
+        return looped;
+    }
+
+    SDL_Texture* Current() const {
+        if (frameCount <= 0) return nullptr;
+        return frames[index];
+    }
+
+    void DestroyFrames() {
+        for (int i = 0; i < frameCount; ++i) {
+            if (frames[i]) {
+                SDL_DestroyTexture(frames[i]);
+                frames[i] = nullptr;
+            }
+        }
+        frameCount = 0;
+    }
+};
+
+struct Projectile {
+    SDL_FPoint pos;
+    SDL_FPoint vel;
+    float angle;
+    float timer;
+    int frame;
+    bool alive;
+
+    Projectile(float x, float y, float vx, float vy, float ang) 
+        : pos{x, y}, vel{vx, vy}, angle(ang), timer(0.0f), frame(0), alive(true) {}
+
+    void Update(float dt) {
+        if (!alive) return;
+        
+        pos.x += vel.x * dt;
+        pos.y += vel.y * dt;
+
+        // Animate through frames
+        timer += dt;
+        const float frameTime = 0.03f; // fast animation
+        while (timer >= frameTime) {
+            timer -= frameTime;
+            frame++;
+            if (frame >= 30) {
+                frame = 0; // loop animation
+            }
+        }
+
+        // Remove if off-screen
+        if (pos.x < -100 || pos.x > kWinW + 100 || pos.y < -100 || pos.y > kWinH + 100) {
+            alive = false;
+        }
+    }
+
+    void Render(SDL_Renderer *r) {
+        if (!alive || !projectileFrames[frame]) return;
+        
+        float w = 128.0f, h = 128.0f; // projectile size
+        SDL_FRect dst{pos.x - w * 0.5f, pos.y - h * 0.5f, w, h};
+        SDL_RenderTextureRotated(r, projectileFrames[frame], nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
+    }
+};
+
+struct DemoProjectile {
+    SDL_FPoint pos;
+    SDL_FPoint vel;
+    float angle = 0.0f;
+    float timer = 0.0f;
+    int frame = 0;
+    bool alive = true;
+    DemoProjectile(float x, float y, float vx, float vy, float ang) : pos{x,y}, vel{vx,vy}, angle(ang) {}
+    void Update(float dt) {
+        if (!alive) return;
+        pos.x += vel.x * dt;
+        pos.y += vel.y * dt;
+        timer += dt;
+        const float frameTime = 0.03f;
+        while (timer >= frameTime) {
+            timer -= frameTime;
+            frame = (frame + 1) % 30;
+        }
+        if (pos.x < -120 || pos.x > kWinW + 120 || pos.y < -120 || pos.y > kWinH + 120) {
+            alive = false;
+        }
+    }
+    void Render(SDL_Renderer *r) {
+        if (!alive || !projectileFrames[frame]) return;
+        float w = 96.0f, h = 96.0f;
+        SDL_FRect dst{pos.x - w * 0.5f, pos.y - h * 0.5f, w, h};
+        SDL_RenderTextureRotated(r, projectileFrames[frame], nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
+    }
+};
+
+struct Coin {
+    SDL_FPoint pos;
+    float speed = 150.0f;   // px/s moving left
+    float timer = 0.0f;
+    int frame = 0;
+    bool alive = true;
+    float baseY = 0.0f;
+    float waveTime = 0.0f;
+    float waveAmp = 6.0f;
+    float waveFreq = 2.0f;
+    float wavePhase = 0.0f;
+
+    Coin(float x, float y, float s, float amp, float freq, float phase)
+        : pos{x, y}, speed{s}, baseY(y), waveAmp(amp), waveFreq(freq), wavePhase(phase) {}
+
+    void Update(float dt) {
+        if (!alive) return;
+        pos.x -= speed * dt;
+        waveTime += dt;
+        pos.y = baseY + SDL_sinf(waveTime * waveFreq + wavePhase) * waveAmp;
+
+        timer += dt;
+        const float frameTime = 0.12f;
+        while (timer >= frameTime) {
+            timer -= frameTime;
+            frame = (frame + 1) % 4;
+        }
+
+        if (pos.x < -40.0f) {
+            alive = false;
+        }
+    }
+
+    void Render(SDL_Renderer *r) {
+        if (!alive || !coinFrames[frame]) return;
+        float size = 32.0f;
+        SDL_FRect dst{pos.x - size * 0.5f, pos.y - size * 0.5f, size, size};
+        SDL_RenderTexture(r, coinFrames[frame], nullptr, &dst);
+    }
+};
+
+enum class BatState { Moving, Dying };
+struct Bat {
+    SDL_FPoint pos;
+    SDL_FPoint vel;
+    BatState state = BatState::Moving;
+    float animTimer = 0.0f;
+    int frame = 0;
+    float speed = 200.0f;
+    bool alive = true;
+    float deathTimer = 0.0f;
+    float bobTimer = 0.0f;
+    float hitFlash = 0.0f;
+    float trackTimer = 0.0f;
+
+    Bat(float x, float y, float spd) : pos{x, y}, vel{0.0f, 0.0f}, speed(spd) {}
+
+    void Update(float dt, const SDL_FPoint &target) {
+        if (!alive) return;
+        if (hitFlash > 0.0f) {
+            hitFlash -= dt;
+            if (hitFlash < 0.0f) hitFlash = 0.0f;
+        }
+        if (state == BatState::Moving) {
+            // simple seek
+            float dx = target.x - pos.x;
+            float dy = target.y - pos.y;
+            float len = SDL_sqrtf(dx*dx + dy*dy);
+            SDL_FPoint desired{0.0f, 0.0f};
+            if (len > 0.001f) {
+                desired.x = dx / len;
+                desired.y = dy / len;
+            }
+            // limited tracking window so player can dodge past
+            trackTimer += dt;
+            if (trackTimer < 1.2f) {
+                float steer = 0.6f; // partial follow
+                vel.x = vel.x * (1.0f - steer) + desired.x * speed * steer;
+                vel.y = vel.y * (1.0f - steer) + desired.y * speed * steer;
+            }
+            // normalize velocity to maintain speed
+            float vlen = SDL_sqrtf(vel.x*vel.x + vel.y*vel.y);
+            if (vlen > 0.001f) {
+                vel.x = vel.x / vlen * speed;
+                vel.y = vel.y / vlen * speed;
+            }
+            // bob adds variability
+            vel.y += SDL_sinf(bobTimer * 4.0f) * 30.0f;
+            pos.x += vel.x * dt;
+            pos.y += vel.y * dt;
+
+            // animate move
+            animTimer += dt;
+            const float ft = 0.06f;
+            while (animTimer >= ft) {
+                animTimer -= ft;
+                frame = (frame + 1) % 15;
+            }
+            bobTimer += dt;
+        } else {
+            // death animation advance
+            deathTimer += dt;
+            const float ft = 0.08f;
+            animTimer += dt;
+            while (animTimer >= ft) {
+                animTimer -= ft;
+                if (frame < 6) frame++;
+            }
+            if (frame >= 6 && deathTimer > 0.6f) {
+                alive = false;
+            }
+        }
+    }
+
+    void Kill() {
+        if (state == BatState::Moving) {
+            state = BatState::Dying;
+            frame = 0;
+            animTimer = 0.0f;
+            deathTimer = 0.0f;
+            hitFlash = 0.2f;
+        }
+    }
+
+    void Render(SDL_Renderer *r) {
+        if (!alive) return;
+        SDL_Texture *tex = nullptr;
+        if (state == BatState::Moving) {
+            tex = batMoveFrames[frame];
+        } else {
+            tex = batDeathFrames[frame];
+        }
+        if (!tex) return;
+        float w = 72.0f, h = 54.0f;
+        SDL_FRect dst{ pos.x - w * 0.5f, pos.y - h * 0.5f, w, h };
+        bool blink = (state == BatState::Dying) && ((SDL_GetTicks() / 80) % 2 == 0);
+        if (blink) {
+            SDL_SetTextureAlphaMod(tex, 140);
+        }
+        if (hitFlash > 0.0f) {
+            SDL_SetTextureColorMod(tex, 255, 220, 220);
+        }
+        SDL_RenderTexture(r, tex, nullptr, &dst);
+        if (hitFlash > 0.0f) {
+            SDL_SetTextureColorMod(tex, 255, 255, 255);
+        }
+        if (blink) {
+            SDL_SetTextureAlphaMod(tex, 255);
+        }
+    }
+
+    SDL_FRect Bounds() const {
+        float w = 64.0f, h = 46.0f;
+        return SDL_FRect{ pos.x - w * 0.5f, pos.y - h * 0.5f, w, h };
+    }
+};
+
+struct ParallaxLayer {
+    SDL_Texture *tex = nullptr;
+    float speed = 0.0f;
+    float y = 0.0f;
+    float x = 0.0f;
+    float texW = 0.0f;
+    float texH = 0.0f;
+
+    void SetTexture(SDL_Texture *t) {
+        tex = t;
+        float w = 0.0f, h = 0.0f;
+        if (tex && SDL_GetTextureSize(tex, &w, &h)) { // returns bool
+            texW = w;
+            texH = h;
+        }
+    }
+
+    void Update(float dt) {
+        if (!tex) return;
+        x -= speed * dt;
+        while (x <= -texW) x += texW;
+        while (x >= texW) x -= texW;
+    }
+
+    void SetSpeed(float s) { speed = s; }
+
+    void Render(SDL_Renderer *r, float viewportW) {
+        if (!tex) return;
+
+        // start one tile to the left of the screen
+        float start = x;
+        while (start > -texW) start -= texW;
+
+        // draw until we've covered the viewport plus one extra tile
+        for (float px = start; px < viewportW + texW; px += texW) {
+            SDL_FRect dst{ px, y, texW, texH };
+            SDL_RenderTexture(r, tex, nullptr, &dst);
+        }
+    }
+};
+
+
+
+static ParallaxLayer farClouds{ nullptr, 30.0f, 100.0f, 0.0f };   // slower, higher
+static ParallaxLayer nearClouds{ nullptr, 50.0f, 125.0f, 0.0f };  // faster, lower
+static ParallaxLayer farMountains {nullptr, 90.0f, 155.0f, 0.0f};
+static ParallaxLayer nearMountains {nullptr, 120.0f, 210.0f, 0.0f};
+static ParallaxLayer nearTrees {nullptr, 150.0f, 240.0f, 0.0f}; 
+
+
+static InputState input;
+static std::vector<Projectile> projectiles;
+static std::vector<Coin> coins;
+static float coinSpawnTimer = 0.0f;
+static float coinSpawnInterval = 1.5f; // seconds
+static std::vector<Bat> bats;
+static float batSpawnTimer = 0.0f;
+static float batSpawnInterval = 3.5f;
+static int warningFrame = 0;
+static float warningTimer = 0.0f;
+static std::mt19937 rng;
+static uint64_t startTicks = 0;
+enum class GameState { Menu, Playing, Paused, Options, GameOver };
+static GameState gameState = GameState::Menu;
+static int bestCoins = 0;
+static float bestTime = 0.0f;
+
+
+static bool newRecord = false;
+static bool soundMuted = false;
+inline bool IsPlayingActive() { return gameState == GameState::Playing && !playerDead; }
+
+
+static CachedText hudCoinText;
+static CachedText hudTimeText;
+
+
+static int hudLastCoins = -1;
+static int hudLastTime = -1;
+
+
+static CachedText menuTitleText;
+static CachedText menuStartText;
+static CachedText menuOptionsText;
+static CachedText optionsStateText;
+static CachedText overTitleText;
+static CachedText overCoinsText;
+static CachedText overTimeText;
+static CachedText newRecordText;
+struct MenuButton {
+    std::string label;
+    SDL_FRect bounds{0,0,0,0};
+    bool hover = false;
+    float phase = 0.0f;
+};
+static MenuButton btnStart{ "START", {0,0,0,0}, false, 0.0f };
+static MenuButton btnOptions{ "OPTIONS", {0,0,0,0}, false, 0.4f };
+struct Demo {
+    SDL_FPoint pos{240.0f, 260.0f};
+    SDL_FPoint vel{80.0f, 0.0f};
+    float t = 0.0f;
+    float angleDeg = 0.0f;
+} static demo;
+static std::vector<DemoProjectile> demoProjectiles;
+static float demoShotTimer = 0.0f;
+
+//defining playrrrrr
+struct Entity {
+    SDL_FRect rect;
+    SDL_FPoint velocity;
+};
+static Entity player = { { 300.0f, 50.0f, 40.0f, 40.0f }, { 0.0f, 0.0f } };
+static const float kGravity = 900.0f;      // px/s^2
+static const float kJumpImpulse = -350.0f; // px/s (if you want jumping)
+static const float kFloorY = 480.0f;       // logical height
+static bool wasSpaceDown = false;
+static AnimState playerAnimState = AnimState::Running;
+static SpriteAnim runningAnim;
+static SpriteAnim flyingAnim;
+static int flyingLoopsRemaining = 0;  // how many fly cycles to play
+static bool facingRight = true;
+
+static void ResetGameState() {
+    player = { { 300.0f, 50.0f, 40.0f, 40.0f }, { 0.0f, 0.0f } };
+    playerAnimState = AnimState::Running;
+    runningAnim.Reset();
+    flyingAnim.Reset();
+    flyingLoopsRemaining = 0;
+    facingRight = true;
+    wasSpaceDown = false;
+    wasMouseDown = false;
+    projectiles.clear();
+    coins.clear();
+    bats.clear();
+    coinCount = 0;
+    gameTimer = 0.0f;
+    coinSpawnTimer = 0.0f;
+    coinSpawnInterval = 1.5f;
+    batSpawnTimer = 0.0f;
+    batSpawnInterval = 3.5f;
+    playerDead = false;
+    gameState = GameState::Playing;
+    newRecord = false;
+}
+
+// per-frame update (call before rendering)
+void UpdatePlayer(float dt) {
+    // apply gravity
+    player.velocity.y += kGravity * dt;
+
+    // integrate
+    player.rect.x += player.velocity.x * dt;
+    player.rect.y += player.velocity.y * dt;
+
+    // floor collision
+    const float floor = kFloorY - player.rect.h;
+    if (player.rect.y > floor) {
+        player.rect.y = floor;
+        player.velocity.y = 0.0f; // stop when hitting the floor
+    }
+
+    // optional: left/right walls
+    if (player.rect.x < 0.0f) {
+        player.rect.x = 0.0f;
+        player.velocity.x = 0.0f;
+    } else if (player.rect.x + player.rect.w > 480.0f) {
+        player.rect.x = 480.0f - player.rect.w;
+        player.velocity.x = 0.0f;
+    }
+
+    //top
+    if (player.rect.y < 0.0f) {
+        player.rect.y = 0.0f;
+        player.velocity.y = 0.0f;
+    }
+}
+
+
+/* This function runs once at startup. */
+SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
+{
+    SDL_SetAppMetadata("Example Renderer Clear", "1.0", "com.example.renderer-clear");
+
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        SDL_Log("Couldn't initialize SDL: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    if (!SDL_CreateWindowAndRenderer("ILUVMUSIC", kWinW, kWinH, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
+        SDL_Log("Couldn't create window/renderer: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    SDL_SetWindowMouseGrab(window, false);  // start in menu: free cursor
+    SDL_ShowCursor();                       // visible in menu/options
+
+    // In SDL_AppInit, after creating renderer:
+    SDL_SetRenderVSync(renderer, 1);  // Add this line
+
+    SDL_SetRenderLogicalPresentation(renderer, kWinW, kWinH, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
+    arrowTex = IMG_LoadTexture(renderer, "assets/arrow.png");
+    cursorTex = IMG_LoadTexture(renderer, "assets/image.png");
+    for (int i = 0; i < 4; ++i) {
+        char file[64];
+        SDL_snprintf(file, sizeof(file), "assets/coin/spr_coin_strip4_%d.png", i);
+        coinFrames[i] = IMG_LoadTexture(renderer, file);
+        if (!coinFrames[i]) {
+            SDL_Log("Failed to load coin frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+    for (int i = 0; i < 9; ++i) {
+        char file[128];
+        SDL_snprintf(file, sizeof(file), "assets/warning/WarningSign%02d.png", i + 1);
+        warningFrames[i] = IMG_LoadTexture(renderer, file);
+        if (!warningFrames[i]) {
+            SDL_Log("Warning: missing warning frame %d: %s", i, SDL_GetError());
+        }
+    }
+    for (int i = 0; i < 15; ++i) {
+        char file[128];
+        SDL_snprintf(file, sizeof(file), "assets/Bat/Move/Frames/Bat Move%d.png", i + 1);
+        batMoveFrames[i] = IMG_LoadTexture(renderer, file);
+        if (!batMoveFrames[i]) {
+            SDL_Log("Failed to load bat move frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+    for (int i = 0; i < 7; ++i) {
+        char file[128];
+        SDL_snprintf(file, sizeof(file), "assets/Bat/Death/Frames/Bat Death%d.png", i + 1);
+        batDeathFrames[i] = IMG_LoadTexture(renderer, file);
+        if (!batDeathFrames[i]) {
+            SDL_Log("Failed to load bat death frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+
+
+        // Load projectile animation frames
+    for (int i = 0; i < 30; ++i) {
+        char file[64];
+        SDL_snprintf(file, sizeof(file), "assets/1/1_%d.png", i);
+        projectileFrames[i] = IMG_LoadTexture(renderer, file);
+        if (!projectileFrames[i]) {
+            SDL_Log("Failed to load projectile frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+
+
+
+    if (!TTF_Init()) {
+        SDL_Log("TTF_Init failed: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+
+
+    font = TTF_OpenFont("ARCADECLASSIC.ttf", 32);
+    if (!font) {
+        SDL_Log("Failed to load font: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    if (!LoadPausedLetters(renderer, font)) {
+        SDL_Log("Failed to load paused letters: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    // Precache static labels
+    SDL_Color white{255,255,255,255};
+    UpdateCachedText(menuTitleText, "BIRD GAME", white);
+    UpdateCachedText(menuStartText, "START", white);
+    UpdateCachedText(menuOptionsText, "OPTIONS", white);
+    UpdateCachedText(overTitleText, "GAME OVER!", white);
+    UpdateCachedText(newRecordText, "NEW RECORD!", white);
+    optionsStateText.text.clear(); // will be set on render
+    hudLastCoins = -1;
+    hudLastTime = -1;
+
+
+
+
+    bgTexture = IMG_LoadTexture(renderer, "sky.png");
+    if (!bgTexture) {
+        SDL_Log("Failed to load background: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    } 
+    
+    psTextureL1 = IMG_LoadTexture(renderer, "far-clouds.png");
+    if(!psTextureL1) {
+        SDL_Log("Failed to load parallax layer 1: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }   
+
+    psTextureL2 = IMG_LoadTexture(renderer, "near-clouds.png");
+    if(!psTextureL2) {
+        SDL_Log("Failed to load parallax layer 2: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    psTextureL3 = IMG_LoadTexture(renderer, "far-mountains.png");
+    if (!psTextureL3) {
+        SDL_Log("Failed to load parallax layer 3: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    psTextureL4 = IMG_LoadTexture(renderer, "mountains.png");
+    if (!psTextureL4) {
+         SDL_Log("Failed to load parallax layer 3: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }      
+    
+    psTextureL5 = IMG_LoadTexture(renderer, "trees.png");
+    if (!psTextureL5) {
+         SDL_Log("Failed to load parallax layer 3: %s", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    // assign textures and speeds
+
+    farMountains.SetTexture(psTextureL3);
+    farMountains.SetSpeed(60.0f); // slowest: farthest layer
+
+    farClouds.SetTexture(psTextureL1);
+    farClouds.SetSpeed(10.0f);   // slower: farther layer
+
+    nearClouds.SetTexture(psTextureL2);
+    nearClouds.SetSpeed(30.0f);  // faster: nearer 
+    
+    nearMountains.SetTexture(psTextureL4);
+    nearMountains.SetSpeed(90.0f); // fastest: nearest layer
+
+    nearTrees.SetTexture(psTextureL5);
+    nearTrees.SetSpeed(120.0f);
+
+    // Load player animations
+    runningAnim.Init(0.12f, 4);  // Running0-Running3
+    for (int i = 0; i < 4; ++i) {
+        char file[64];
+        SDL_snprintf(file, sizeof(file), "assets/Running/Running%d.png", i);
+        runningAnim.frames[i] = IMG_LoadTexture(renderer, file);
+        if (!runningAnim.frames[i]) {
+            SDL_Log("Failed to load running frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+
+    flyingAnim.Init(0.08f, 5);  // Flying0-Flying5
+    for (int i = 0; i < 5; ++i) {
+        char file[64];
+        SDL_snprintf(file, sizeof(file), "assets/Flying/Flying%d.png", i);
+        flyingAnim.frames[i] = IMG_LoadTexture(renderer, file);
+        if (!flyingAnim.frames[i]) {
+            SDL_Log("Failed to load flying frame %d: %s", i, SDL_GetError());
+            return SDL_APP_FAILURE;
+        }
+    }
+
+
+    SDL_SetRenderLogicalPresentation(renderer, kWinW, kWinH, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
+    projectiles.reserve(256);
+    coins.reserve(256);
+    bats.reserve(128);
+    demoProjectiles.reserve(64);
+
+    rng.seed((uint32_t)SDL_GetTicks());
+    startTicks = SDL_GetTicks();
+
+    return SDL_APP_CONTINUE;  /* carry on with the program! */
+}
+
+
+
+
+
+/* This function runs when a new event (mouse input, keypresses, etc) occurs. */
+SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
+{
+    if (event->type == SDL_EVENT_QUIT) {
+        return SDL_APP_SUCCESS;  /* end the program, reporting success to the OS. */
+    }
+    return SDL_APP_CONTINUE;  /* carry on with the program! */
+}
+
+/* This function runs once per frame, and is the heart of the program. */
+SDL_AppResult SDL_AppIterate(void *appstate)
+{
+
+
+    SDL_RenderClear(renderer);
+
+    //key
+    input.Update();
+
+    if (bgTexture) {
+        SDL_RenderTexture(renderer, bgTexture, NULL, NULL); // fills the current viewport
+    }
+
+
+    
+    //physics rendering stuff
+    static uint64_t last = 0;
+    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+
+    float dt = (last == 0) ? 0.0f : (float)(now - last) / (float)freq;
+    if (dt > 0.1f) dt = 0.1f; // clamp huge spikes
+    last = now;
+
+    bool escapeDown = input.Down(SDL_SCANCODE_ESCAPE);
+    if (escapeDown && !wasEscapeDown) {
+        if (playerDead && gameState == GameState::GameOver) {
+            ResetGameState();
+            SDL_SetWindowMouseGrab(window, true);
+            SDL_HideCursor();
+            last = SDL_GetPerformanceCounter();
+            dt = 0.0f;
+        } else if (gameState == GameState::Playing) {
+            gameState = GameState::Paused;
+            SDL_SetWindowMouseGrab(window, false);
+            SDL_ShowCursor();
+            last = SDL_GetPerformanceCounter();
+            dt = 0.0f;
+        } else if (gameState == GameState::Paused) {
+            gameState = GameState::Playing;
+            SDL_SetWindowMouseGrab(window, true);
+            SDL_HideCursor();
+            last = SDL_GetPerformanceCounter();
+            dt = 0.0f;
+        } else if (gameState == GameState::Options) {
+            gameState = GameState::Menu;
+            SDL_ShowCursor();
+            SDL_SetWindowMouseGrab(window, false);
+            last = SDL_GetPerformanceCounter();
+            dt = 0.0f;
+        }
+    }
+    wasEscapeDown = escapeDown;
+
+    if (playerDead || gameState == GameState::Paused || gameState == GameState::Options) {
+        dt = 0.0f;
+    }
+
+    if (IsPlayingActive()) {
+        gameTimer += dt;
+        warningTimer += dt;
+        const float warnFrameTime = 0.08f;
+        while (warningTimer >= warnFrameTime) {
+            warningTimer -= warnFrameTime;
+            warningFrame = (warningFrame + 1) % 9;
+        }
+    }
+
+    // Demo motion in menu
+    if (gameState == GameState::Menu) {
+        float prevX = demo.pos.x;
+        float prevY = demo.pos.y;
+        demo.t += dt;
+        demo.pos.x = kWinW * 0.5f + SDL_sinf(demo.t * 0.8f) * 70.0f;
+        demo.pos.y = 260.0f + SDL_sinf(demo.t * 1.5f) * 28.0f;
+        demo.vel.x = (demo.pos.x - prevX) / (dt > 0 ? dt : 1.0f);
+        demo.vel.y = (demo.pos.y - prevY) / (dt > 0 ? dt : 1.0f);
+        demo.angleDeg = SDL_atan2(demo.vel.y, demo.vel.x) * (180.0f / SDL_PI_D);
+
+        demoShotTimer += dt;
+        if (demoShotTimer >= 0.9f) {
+            demoShotTimer = 0.0f;
+            float speed = 260.0f;
+            float rad = demo.angleDeg * SDL_PI_F / 180.0f;
+            float vx = SDL_cosf(rad) * speed;
+            float vy = SDL_sinf(rad) * speed;
+            demoProjectiles.emplace_back(demo.pos.x, demo.pos.y, vx, vy, demo.angleDeg);
+        }
+        for (auto &dp : demoProjectiles) dp.Update(dt);
+        demoProjectiles.erase(std::remove_if(demoProjectiles.begin(), demoProjectiles.end(),
+                            [](const DemoProjectile &p){ return !p.alive; }),
+                            demoProjectiles.end());
+    }
+
+    farClouds.Update(dt);
+    farClouds.Render(renderer, (float)kWinW);
+
+    nearClouds.Update(dt);
+    nearClouds.Render(renderer, (float)kWinW);
+
+    farMountains.Update(dt);
+    farMountains.Render(renderer, (float)kWinW);
+
+    nearMountains.Update(dt);
+    nearMountains.Render(renderer, (float)kWinW);
+
+    nearTrees.Update(dt);
+    nearTrees.Render(renderer, (float)kWinW);
+
+
+
+
+    // jump mechanic 
+    const float floorY = kFloorY - player.rect.h;
+    bool onGround = (player.rect.y >= floorY - 0.5f);
+
+    bool spaceDown = input.Down(SDL_SCANCODE_SPACE) || input.Down(SDL_SCANCODE_W);
+
+    bool leftDown = input.Down(SDL_SCANCODE_A) || input.Down(SDL_SCANCODE_LEFT);
+    bool rightDown = input.Down(SDL_SCANCODE_D) || input.Down(SDL_SCANCODE_RIGHT);
+
+    if (IsPlayingActive()) {
+        if (leftDown && !rightDown) {
+            facingRight = false;
+        } else if (rightDown && !leftDown) {
+            facingRight = true;
+        }
+
+        if (leftDown && !rightDown) {
+            player.velocity.x = -200.0f;
+        } else if (rightDown && !leftDown) {
+            player.velocity.x = 200.0f;
+        } else {
+            player.velocity.x = 0.0f;
+        }
+
+        if (spaceDown && !wasSpaceDown) {
+            player.velocity.y = kJumpImpulse; // negative = up
+            flyingLoopsRemaining = 1;         // play two fly cycles
+            playerAnimState = AnimState::Flying;
+            flyingAnim.Reset();
+        }
+    }
+    wasSpaceDown = spaceDown;
+        
+    // animation state and update
+    if (gameState == GameState::Playing && playerAnimState == AnimState::Flying) {
+        bool looped = flyingAnim.Update(dt);
+        if (looped && flyingLoopsRemaining > 0) {
+            flyingLoopsRemaining--;
+            if (flyingLoopsRemaining <= 0) {
+                playerAnimState = AnimState::Running;
+                runningAnim.Reset();
+            }
+        }
+    } else if (gameState == GameState::Playing) {
+        runningAnim.Update(dt);
+        // if not flying and no loops queued, ensure we stay running
+        if (!spaceDown) {
+            playerAnimState = AnimState::Running;
+        }
+    }
+
+    if (gameState == GameState::Playing) {
+        UpdatePlayer(dt);
+    }
+
+    // Spawn coins off-screen and move left
+    if (IsPlayingActive()) {
+        coinSpawnTimer += dt;
+        if (coinSpawnTimer >= coinSpawnInterval) {
+            coinSpawnTimer = 0.0f;
+            std::uniform_real_distribution<float> ydist(30.0f, kWinH - 30.0f);
+            std::uniform_real_distribution<float> speedDist(150.0f, 240.0f);
+            std::uniform_real_distribution<float> intervalDist(1.0f, 2.2f);
+            std::uniform_real_distribution<float> ampDist(4.0f, 12.0f);
+            std::uniform_real_distribution<float> freqDist(1.5f, 3.8f);
+            std::uniform_real_distribution<float> phaseDist(0.0f, SDL_PI_F * 2.0f);
+            std::uniform_int_distribution<int> patternDist(0, 2); // 0 single,1 row,2 stack/column
+            std::uniform_int_distribution<int> countDist(1, 3);
+
+            float spawnX = kWinW + 50.0f;
+            float baseY = ydist(rng);
+            int pattern = patternDist(rng);
+            int count = countDist(rng);
+            float gap = 36.0f;
+
+            auto makeCoin = [&](float x, float y) {
+                float speed = speedDist(rng);
+                float amp = ampDist(rng);
+                float freq = freqDist(rng);
+                float phase = phaseDist(rng);
+                coins.emplace_back(x, y, speed, amp, freq, phase);
+            };
+
+            if (pattern == 0) {
+                makeCoin(spawnX, baseY);
+                if (rng() % 3 == 0) makeCoin(spawnX + gap, baseY - gap * 0.3f); // occasional buddy
+            } else if (pattern == 1) {
+                for (int i = 0; i < count; ++i) {
+                    makeCoin(spawnX + i * gap, baseY + SDL_sinf(0.6f * i) * 10.0f);
+                }
+            } else {
+                for (int i = 0; i < count; ++i) {
+                    makeCoin(spawnX, baseY + (i - 1) * gap + SDL_sinf(0.4f * i) * 8.0f);
+                }
+            }
+
+            coinSpawnInterval = intervalDist(rng);
+        }
+    }
+
+    if (IsPlayingActive()) {
+        for (auto &c : coins) {
+            c.Update(dt);
+        }
+        coins.erase(std::remove_if(coins.begin(), coins.end(), [](const Coin &c){ return !c.alive; }), coins.end());
+    }
+
+    // Spawn bats from all edges
+    if (IsPlayingActive()) {
+        batSpawnTimer += dt;
+        if (batSpawnTimer >= batSpawnInterval) {
+            batSpawnTimer = 0.0f;
+            std::uniform_real_distribution<float> xdist(-60.0f, kWinW + 60.0f);
+            std::uniform_real_distribution<float> ydist(-60.0f, kWinH + 60.0f);
+            std::uniform_real_distribution<float> speedDist(220.0f, 300.0f);
+            std::uniform_real_distribution<float> intervalDist(2.2f, 3.8f);
+            std::uniform_int_distribution<int> sideDist(0, 3); // 0 right,1 left,2 top,3 bottom
+
+            float spawnX = kWinW + 80.0f;
+            float spawnY = kWinH * 0.5f;
+            int side = sideDist(rng);
+            if (side == 0) { // right
+                spawnX = kWinW + 80.0f;
+                spawnY = ydist(rng);
+            } else if (side == 1) { // left
+                spawnX = -80.0f;
+                spawnY = ydist(rng);
+            } else if (side == 2) { // top
+                spawnX = xdist(rng);
+                spawnY = -80.0f;
+            } else { // bottom
+                spawnX = xdist(rng);
+                spawnY = kWinH + 80.0f;
+            }
+
+            float spd = speedDist(rng);
+            bats.emplace_back(spawnX, spawnY, spd);
+            batSpawnInterval = intervalDist(rng);
+        }
+    }
+
+    std::vector<SDL_FRect> warningIcons;
+
+    if (IsPlayingActive()) {
+        SDL_FPoint target{ player.rect.x + player.rect.w * 0.5f, player.rect.y + player.rect.h * 0.5f };
+        for (auto &b : bats) {
+            b.Update(dt, target);
+        }
+        bats.erase(std::remove_if(bats.begin(), bats.end(), [](const Bat &b){ return !b.alive; }), bats.end());
+
+        // collect warnings for approaching off-screen bats near player's edge
+        float pcx = target.x;
+        float pcy = target.y;
+        float warnMargin = 18.0f;
+        for (auto &b : bats) {
+            if (!b.alive || b.state != BatState::Moving) continue;
+            bool offLeft = b.pos.x < -40.0f;
+            bool offRight = b.pos.x > kWinW + 40.0f;
+            bool offTop = b.pos.y < -40.0f;
+            bool offBot = b.pos.y > kWinH + 40.0f;
+            if (!(offLeft || offRight || offTop || offBot)) continue;
+
+            bool headingIn = (offLeft && b.vel.x > 0) || (offRight && b.vel.x < 0) ||
+                             (offTop && b.vel.y > 0) || (offBot && b.vel.y < 0);
+            if (!headingIn) continue;
+
+            bool playerNearEdge = (offLeft && pcx < 140.0f) ||
+                                  (offRight && pcx > kWinW - 140.0f) ||
+                                  (offTop && pcy < 140.0f) ||
+                                  (offBot && pcy > kWinH - 140.0f);
+            if (!playerNearEdge) continue;
+
+            float w = 40.0f, h = 40.0f;
+            SDL_FRect icon{0,0,w,h};
+            if (offLeft) {
+                icon.x = warnMargin;
+                icon.y = ClampF(b.pos.y, warnMargin, (float)kWinH - warnMargin - h);
+            } else if (offRight) {
+                icon.x = kWinW - warnMargin - w;
+                icon.y = ClampF(b.pos.y, warnMargin, (float)kWinH - warnMargin - h);
+            } else if (offTop) {
+                icon.y = warnMargin;
+                icon.x = ClampF(b.pos.x, warnMargin, (float)kWinW - warnMargin - w);
+            } else { // bottom
+                icon.y = kWinH - warnMargin - h;
+                icon.x = ClampF(b.pos.x, warnMargin, (float)kWinW - warnMargin - w);
+            }
+            warningIcons.push_back(icon);
+        }
+    }
+
+        // Mouse click to shoot projectile
+    float mx = 0.0f, my = 0.0f;
+    Uint32 mouseState = 0;
+    GetLogicalMouse(mx, my, mouseState);
+    bool mouseDown = (mouseState & SDL_BUTTON_LMASK) != 0;
+
+    if (gameState == GameState::Menu && mouseDown && !wasMouseDown) {
+        if (btnStart.hover) {
+            ResetGameState();
+            SDL_SetWindowMouseGrab(window, true);
+            SDL_HideCursor();
+        } else if (btnOptions.hover) {
+            gameState = GameState::Options;
+            SDL_ShowCursor();
+            SDL_SetWindowMouseGrab(window, false);
+        }
+    }
+
+    if (gameState == GameState::Options && mouseDown && !wasMouseDown) {
+        // toggle mute when clicking anywhere on the options label area
+        int w=0,h=0;
+        const char *label = soundMuted ? "Sound: Muted" : "Sound: On";
+        SDL_Surface *s = TTF_RenderText_Blended(font, label, SDL_strlen(label), SDL_Color{255,255,255,255});
+        if (s) { w = s->w; h = s->h; SDL_DestroySurface(s); }
+        float x = kWinW * 0.5f - w * 0.5f;
+        float y = kWinH * 0.5f;
+        if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
+            soundMuted = !soundMuted;
+            DestroyCached(optionsStateText);
+        }
+    }
+
+    if (IsPlayingActive() && mouseDown && !wasMouseDown) {
+        // Spawn projectile
+        float pcx = player.rect.x + player.rect.w * 0.5f;
+        float pcy = player.rect.y + player.rect.h * 0.5f;
+
+        float dx = mx - pcx;
+        float dy = my - pcy;
+        float len = SDL_sqrtf(dx*dx + dy*dy);
+        if (len < 0.001f) len = 0.001f;
+        dx /= len; dy /= len;
+
+        const float speed = 400.0f; // projectile speed
+        float vx = dx * speed;
+        float vy = dy * speed;
+        float angle = SDL_atan2(dy, dx) * (180.0f / SDL_PI_D);
+
+        projectiles.emplace_back(pcx, pcy, vx, vy, angle);
+    }
+    wasMouseDown = mouseDown;
+
+    // Update projectiles
+    if (IsPlayingActive()) {
+        for (auto &p : projectiles) {
+            p.Update(dt);
+        }
+
+        // Remove dead projectiles
+        projectiles.erase(
+            std::remove_if(projectiles.begin(), projectiles.end(), 
+                [](const Projectile &p) { return !p.alive; }),
+            projectiles.end()
+        );
+
+        // Coin collection check
+        SDL_FRect playerBox = player.rect;
+        const float coinSize = 32.0f;
+        for (auto &c : coins) {
+            if (!c.alive) continue;
+            SDL_FRect coinBox{ c.pos.x - coinSize * 0.5f, c.pos.y - coinSize * 0.5f, coinSize, coinSize };
+            if (AABBOverlap(playerBox, coinBox)) {
+                c.alive = false;
+                coinCount++;
+            }
+        }
+
+        // Projectile vs bats
+        for (auto &p : projectiles) {
+            if (!p.alive) continue;
+            SDL_FRect projBox{ p.pos.x - 10.0f, p.pos.y - 10.0f, 20.0f, 20.0f };
+            for (auto &b : bats) {
+                if (!b.alive || b.state == BatState::Dying) continue;
+                if (AABBOverlap(projBox, b.Bounds())) {
+                    p.alive = false;
+                    b.Kill();
+                }
+            }
+        }
+
+        // Bat vs player
+        for (auto &b : bats) {
+            if (!b.alive || b.state != BatState::Moving) continue;
+            if (AABBOverlap(playerBox, b.Bounds())) {
+                playerDead = true;
+                gameState = GameState::GameOver;
+                // update records
+                if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
+                    bestCoins = coinCount;
+                    bestTime = gameTimer;
+                    newRecord = true;
+                } else {
+                    newRecord = false;
+                }
+                SDL_SetWindowMouseGrab(window, false);
+                SDL_ShowCursor();
+                break;
+            }
+        }
+    }
+
+
+
+
+
+    // then draw
+    SDL_SetRenderDrawColorFloat(renderer, kcolor.r, kcolor.g, kcolor.b, kcolor.a);
+    //SDL_RenderFillRect(renderer, &player.rect);
+    SDL_SetRenderDrawColorFloat(renderer, koutline.r, koutline.g, koutline.b, koutline.a);
+    //SDL_RenderRect(renderer, &player.rect);
+
+    if (gameState != GameState::Menu) {
+        SDL_Texture *playerTex = (playerAnimState == AnimState::Running) ? runningAnim.Current() : flyingAnim.Current();
+        if (playerTex) {
+            SDL_FRect dst = player.rect;  // render using collision box bounds
+            SDL_FlipMode flip = facingRight ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
+            SDL_RenderTextureRotated(renderer, playerTex, nullptr, &dst, 0.0, nullptr, flip);
+        }
+
+        for (auto &b : bats) {
+            b.Render(renderer);
+        }
+
+        for (auto &p : projectiles) {
+            p.Render(renderer);
+        }
+
+        for (auto &c : coins) {
+            c.Render(renderer);
+        }
+    }
+
+    // Warning icons for incoming bats off-screen
+    if (warningFrames[warningFrame]) {
+        for (const auto &wicon : warningIcons) {
+            SDL_RenderTexture(renderer, warningFrames[warningFrame], nullptr, &wicon);
+        }
+    }
+
+    // Aim arrow following mouse (larger and closer)
+    if (arrowTex) {
+        static float aimX = 0.0f, aimY = 0.0f, aimAngleDeg = 0.0f;
+        if (gameState == GameState::Playing) {
+            float mx = 0.0f, my = 0.0f;
+            GetLogicalMouse(mx, my); // logical coords
+
+            float pcx = player.rect.x + player.rect.w * 0.5f;
+            float pcy = player.rect.y + player.rect.h * 0.5f;
+
+            float dx = mx - pcx;
+            float dy = my - pcy;
+            float len = SDL_sqrtf(dx*dx + dy*dy);
+            if (len < 0.001f) len = 0.001f;
+            dx /= len; dy /= len;
+
+            const float radius = 25.0f;  // closer to the bird
+            aimX = pcx + dx * radius;
+            aimY = pcy + dy * radius;
+            aimAngleDeg = SDL_atan2(dy, dx) * (180.0 / SDL_PI_D);
+        } else if (aimX == 0.0f && aimY == 0.0f) {
+            // initialize once if paused before first frame
+            aimX = player.rect.x + player.rect.w * 0.5f;
+            aimY = player.rect.y + player.rect.h * 0.5f;
+            aimAngleDeg = 0.0f;
+        }
+
+        float aw = 32.0f, ah = 32.0f;  // larger arrow
+        SDL_FRect adst{ aimX - aw * 0.5f, aimY - ah * 0.5f, aw, ah };
+        SDL_RenderTextureRotated(renderer, arrowTex, nullptr, &adst, aimAngleDeg, nullptr, SDL_FLIP_NONE);
+    }
+
+    // Custom cursor rendered at the actual mouse position while hidden system cursor is off
+    if (gameState == GameState::Playing && cursorTex) {
+        float cx = 0.0f, cy = 0.0f;
+        GetLogicalMouse(cx, cy);
+        if (cx < 0.0f) cx = 0.0f;
+        if (cy < 0.0f) cy = 0.0f;
+        if (cx > (float)kWinW) cx = (float)kWinW;
+        if (cy > (float)kWinH) cy = (float)kWinH;
+
+        float cw = 20.0f, ch = 20.0f;
+        SDL_FRect cdst{ cx - cw * 0.5f, cy - ch * 0.5f, cw, ch };
+        SDL_RenderTexture(renderer, cursorTex, nullptr, &cdst);
+    }
+
+    // HUD (only during gameplay)
+    if (gameState == GameState::Playing) {
+        int totalSeconds = (int)gameTimer;
+        int minutes = totalSeconds / 60;
+        int seconds = totalSeconds % 60;
+        char timeBuf[8];
+        SDL_snprintf(timeBuf, sizeof(timeBuf), "%02d %02d", minutes, seconds);
+        std::string coinLabel = "Coins " + std::to_string(coinCount);
+        std::string timeLabel = std::string("Time ") + timeBuf;
+        SDL_Color white{255,255,255,255};
+        if (coinCount != hudLastCoins) {
+            hudLastCoins = coinCount;
+            UpdateCachedText(hudCoinText, coinLabel, white);
+        }
+        if (totalSeconds != hudLastTime) {
+            hudLastTime = totalSeconds;
+            UpdateCachedText(hudTimeText, timeLabel, white);
+        }
+        float margin = 16.0f;
+        double hudT = (double)SDL_GetTicks() / 1000.0;
+        float bob = SDL_sinf((float)hudT * 3.0f) * 2.5f;
+        if (hudCoinText.tex) {
+            float coinX = (float)kWinW - hudCoinText.w - margin;
+            SDL_FRect dst{ coinX, 10.0f + bob, hudCoinText.w, hudCoinText.h };
+            SDL_RenderTexture(renderer, hudCoinText.tex, nullptr, &dst);
+        }
+        if (hudTimeText.tex) {
+            float timeX = (float)kWinW - hudTimeText.w - margin;
+            SDL_FRect dst{ timeX, 32.0f + bob, hudTimeText.w, hudTimeText.h };
+            SDL_RenderTexture(renderer, hudTimeText.tex, nullptr, &dst);
+        }
+    }
+
+    // Paused wave text overlay
+    if (gameState == GameState::Paused) {
+        double t = (double)SDL_GetTicks() / 1000.0;
+        float totalW = 0.0f;
+        float maxH = 0.0f;
+        const float spacing = 4.0f;
+        for (int i = 0; i < 6; ++i) {
+            totalW += pausedLetters[i].w;
+            if (i < 5) totalW += spacing;
+            if (pausedLetters[i].h > maxH) maxH = pausedLetters[i].h;
+        }
+        float startX = (kWinW - totalW) * 0.5f;
+        float baseY = (kWinH - maxH) * 0.5f;
+        float x = startX;
+        for (int i = 0; i < 6; ++i) {
+            float yOffset = SDL_sinf((float)(t * pausedWaveFreq + pausedWavePhaseStep * i)) * pausedWaveAmp;
+            SDL_FRect dst{ x, baseY + yOffset, pausedLetters[i].w, pausedLetters[i].h };
+            if (pausedLetters[i].tex) {
+                SDL_SetTextureColorMod(pausedLetters[i].tex, 0, 0, 0);
+                SDL_SetTextureAlphaMod(pausedLetters[i].tex, 200);
+                SDL_FRect shadowDst{ dst.x + 3.0f, dst.y + 3.0f, dst.w, dst.h };
+                SDL_RenderTexture(renderer, pausedLetters[i].tex, nullptr, &shadowDst);
+                SDL_FRect shadowDst2{ dst.x + 5.0f, dst.y + 5.0f, dst.w, dst.h };
+                SDL_RenderTexture(renderer, pausedLetters[i].tex, nullptr, &shadowDst2);
+                SDL_SetTextureColorMod(pausedLetters[i].tex, 255, 255, 255);
+                SDL_SetTextureAlphaMod(pausedLetters[i].tex, 255);
+                SDL_RenderTexture(renderer, pausedLetters[i].tex, nullptr, &dst);
+            }
+            x += pausedLetters[i].w + spacing;
+        }
+    }
+
+    // Menu
+    if (gameState == GameState::Menu) {
+        double t = (double)SDL_GetTicks() / 1000.0;
+        float titleWave = SDL_sinf((float)t * 2.2f) * 4.0f;
+        if (menuTitleText.tex) {
+            SDL_FRect dst{ kWinW * 0.5f - menuTitleText.w * 0.5f, 46.0f + titleWave, menuTitleText.w, menuTitleText.h };
+            SDL_RenderTexture(renderer, menuTitleText.tex, nullptr, &dst);
+        }
+
+        // buttons with sine wobble and hover blink
+        btnStart.bounds.w = menuStartText.w;
+        btnStart.bounds.h = menuStartText.h;
+        btnStart.bounds.x = kWinW * 0.5f - btnStart.bounds.w * 0.5f;
+        btnStart.bounds.y = 120.0f;
+
+        btnOptions.bounds.w = menuOptionsText.w;
+        btnOptions.bounds.h = menuOptionsText.h;
+        btnOptions.bounds.x = kWinW * 0.5f - btnOptions.bounds.w * 0.5f;
+        btnOptions.bounds.y = 160.0f;
+
+        Uint32 mstate = SDL_GetMouseState(nullptr, nullptr);
+        float mx=0.0f, my=0.0f; GetLogicalMouse(mx,my);
+        auto hoverCheck = [&](MenuButton &b){
+            b.hover = (mx >= b.bounds.x && mx <= b.bounds.x + b.bounds.w &&
+                       my >= b.bounds.y && my <= b.bounds.y + b.bounds.h);
+        };
+        hoverCheck(btnStart);
+        hoverCheck(btnOptions);
+
+        auto renderButton = [&](const MenuButton &b, float phase){
+            float hoverWave = b.hover ? SDL_sinf((float)t * 4.0f + phase) * 4.0f : 0.0f;
+            Uint8 alpha = b.hover ? (Uint8)(200 + 55 * (0.5f + 0.5f * SDL_sinf((float)t * 6.0f + phase))) : 255;
+            CachedText *ct = (b.label == "START") ? &menuStartText : &menuOptionsText;
+            if (ct->tex) {
+                SDL_FRect dst{ b.bounds.x, b.bounds.y + hoverWave, ct->w, ct->h };
+                SDL_SetTextureColorMod(ct->tex, 255,255,255);
+                SDL_SetTextureAlphaMod(ct->tex, alpha);
+                SDL_FRect s1{ dst.x + 2.0f, dst.y + 2.0f, dst.w, dst.h };
+                SDL_FRect s2{ dst.x + 4.0f, dst.y + 4.0f, dst.w, dst.h };
+                SDL_SetTextureAlphaMod(ct->tex, 140);
+                SDL_RenderTexture(renderer, ct->tex, nullptr, &s1);
+                SDL_RenderTexture(renderer, ct->tex, nullptr, &s2);
+                SDL_SetTextureAlphaMod(ct->tex, alpha);
+                SDL_RenderTexture(renderer, ct->tex, nullptr, &dst);
+            }
+        };
+        renderButton(btnStart, 0.0f);
+        renderButton(btnOptions, 1.0f);
+
+        // demo player + arrow + demo shots
+        SDL_FRect demoRect{ demo.pos.x - 20.0f, demo.pos.y - 20.0f, 40.0f, 40.0f };
+        if (runningAnim.Current()) {
+            SDL_RenderTextureRotated(renderer, runningAnim.Current(), nullptr, &demoRect, 0.0, nullptr, SDL_FLIP_NONE);
+        }
+        for (auto &dp : demoProjectiles) {
+            dp.Render(renderer);
+        }
+        if (arrowTex) {
+            float radius = 30.0f;
+            float ax = demo.pos.x + SDL_cosf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
+            float ay = demo.pos.y + SDL_sinf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
+            SDL_FRect adst{ ax - 16.0f, ay - 16.0f, 32.0f, 32.0f };
+            SDL_RenderTextureRotated(renderer, arrowTex, nullptr, &adst, demo.angleDeg, nullptr, SDL_FLIP_NONE);
+        }
+    }
+
+    // Options placeholder
+    if (gameState == GameState::Options) {
+        SDL_Color white{255,255,255,255};
+        UpdateCachedText(optionsStateText, soundMuted ? "Sound: Muted" : "Sound: On", white);
+        RenderLabel("OPTIONS", kWinW * 0.5f - 70.0f, kWinH * 0.5f - 40.0f);
+        if (optionsStateText.tex) {
+            SDL_FRect dst{ kWinW * 0.5f - optionsStateText.w * 0.5f, kWinH * 0.5f, optionsStateText.w, optionsStateText.h };
+            SDL_RenderTexture(renderer, optionsStateText.tex, nullptr, &dst);
+        }
+        RenderLabel("ESC to return", kWinW * 0.5f - 90.0f, kWinH * 0.5f + 30.0f);
+    }
+
+    // Game over overlay
+    if (gameState == GameState::GameOver) {
+        if (overTitleText.tex) {
+            SDL_FRect dst{ kWinW * 0.5f - overTitleText.w * 0.5f, kWinH * 0.5f - 40.0f, overTitleText.w, overTitleText.h };
+            SDL_RenderTexture(renderer, overTitleText.tex, nullptr, &dst);
+        }
+        int totalSeconds = (int)gameTimer;
+        int minutes = totalSeconds / 60;
+        int seconds = totalSeconds % 60;
+        char timeBuf[8];
+        SDL_snprintf(timeBuf, sizeof(timeBuf), "%02d %02d", minutes, seconds);
+        SDL_Color white{255,255,255,255};
+        UpdateCachedText(overCoinsText, "Coins " + std::to_string(coinCount), white);
+        UpdateCachedText(overTimeText, std::string("Time ") + timeBuf, white);
+
+        double t = (double)SDL_GetTicks() / 1000.0;
+        float yOffset = SDL_sinf((float)(t * 3.0f)) * 4.0f;
+        float margin = 14.0f;
+        if (overCoinsText.tex) {
+            SDL_FRect dst{ kWinW - overCoinsText.w - margin, 14.0f + yOffset, overCoinsText.w, overCoinsText.h };
+            SDL_RenderTexture(renderer, overCoinsText.tex, nullptr, &dst);
+        }
+        if (overTimeText.tex) {
+            SDL_FRect dst{ kWinW - overTimeText.w - margin, 36.0f + yOffset, overTimeText.w, overTimeText.h };
+            SDL_RenderTexture(renderer, overTimeText.tex, nullptr, &dst);
+        }
+
+        if (newRecord && newRecordText.tex) {
+            float recY = kWinH * 0.5f - 10.0f + SDL_sinf((float)(t * 3.5f)) * 8.0f;
+            Uint8 r = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.0f));
+            Uint8 g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 2.0f));
+            Uint8 b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 4.0f));
+            SDL_SetTextureColorMod(newRecordText.tex, r, g, b);
+            SDL_FRect dst{ kWinW * 0.5f - newRecordText.w * 0.5f, recY, newRecordText.w, newRecordText.h };
+            SDL_RenderTexture(renderer, newRecordText.tex, nullptr, &dst);
+        }
+
+        RenderLabel("ESC to restart", kWinW * 0.5f - 90.0f, kWinH * 0.5f + 40.0f);
+    }
+
+
+
+
+
+    /* put the newly-cleared rendering on the screen. */
+    SDL_RenderPresent(renderer);
+
+    return SDL_APP_CONTINUE;  /* carry on with the program! */
+}
+
+/* This function runs once at shutdown. */
+void SDL_AppQuit(void *appstate, SDL_AppResult result)
+{
+    /* SDL will clean up the window/renderer for us. */
+
+    if (bgTexture) {
+        SDL_DestroyTexture(bgTexture);
+        bgTexture = NULL;
+    }
+    if (psTextureL1) { SDL_DestroyTexture(psTextureL1); psTextureL1 = NULL; }
+    if (psTextureL2) { SDL_DestroyTexture(psTextureL2); psTextureL2 = NULL; }
+    if (psTextureL3) { SDL_DestroyTexture(psTextureL3); psTextureL3 = NULL; }
+    if (psTextureL4) { SDL_DestroyTexture(psTextureL4); psTextureL4 = NULL; }
+    if (psTextureL5) { SDL_DestroyTexture(psTextureL5); psTextureL5 = NULL; }
+
+    runningAnim.DestroyFrames();
+    flyingAnim.DestroyFrames();
+
+
+    if (textTex) { SDL_DestroyTexture(textTex); textTex = nullptr; }
+    DestroyCached(hudCoinText);
+    DestroyCached(hudTimeText);
+    DestroyCached(menuTitleText);
+    DestroyCached(menuStartText);
+    DestroyCached(menuOptionsText);
+    DestroyCached(optionsStateText);
+    DestroyCached(overTitleText);
+    DestroyCached(overCoinsText);
+    DestroyCached(overTimeText);
+    if (arrowTex) { SDL_DestroyTexture(arrowTex); arrowTex = nullptr; }
+    if (cursorTex) { SDL_DestroyTexture(cursorTex); cursorTex = nullptr; }
+    for (auto &pl : pausedLetters) {
+        if (pl.tex) { SDL_DestroyTexture(pl.tex); pl.tex = nullptr; }
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (coinFrames[i]) { SDL_DestroyTexture(coinFrames[i]); coinFrames[i] = nullptr; }
+    }
+    for (int i = 0; i < 15; ++i) {
+        if (batMoveFrames[i]) { SDL_DestroyTexture(batMoveFrames[i]); batMoveFrames[i] = nullptr; }
+    }
+    for (int i = 0; i < 7; ++i) {
+        if (batDeathFrames[i]) { SDL_DestroyTexture(batDeathFrames[i]); batDeathFrames[i] = nullptr; }
+    }
+    for (int i = 0; i < 9; ++i) {
+        if (warningFrames[i]) { SDL_DestroyTexture(warningFrames[i]); warningFrames[i] = nullptr; }
+    }
+    DestroyCached(hudCoinText);
+    DestroyCached(hudTimeText);
+    DestroyCached(menuTitleText);
+    DestroyCached(menuStartText);
+    DestroyCached(menuOptionsText);
+    DestroyCached(optionsStateText);
+    DestroyCached(overTitleText);
+    DestroyCached(overCoinsText);
+    DestroyCached(overTimeText);
+    DestroyCached(newRecordText);
+
+    if (font) { TTF_CloseFont(font); font = nullptr; }
+    for (int i = 0; i < 30; ++i) {
+    if (projectileFrames[i]) {
+        SDL_DestroyTexture(projectileFrames[i]);
+        projectileFrames[i] = nullptr;
+    }
+    }
+    TTF_Quit();
+    SDL_Quit();
+}
