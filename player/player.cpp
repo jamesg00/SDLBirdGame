@@ -116,6 +116,9 @@ void Player::Update(float dt) {
         }
     }
 
+
+    
+
     // Shooting (left click) disabled during autopilot
     float mx = 0.0f, my = 0.0f;
     Uint32 mouseState = 0;
@@ -142,6 +145,20 @@ void Player::Update(float dt) {
         }
     }
     wasMouseDown = mouseDown;
+
+    bool onPlatform = false;
+
+    for (const auto &plat : platforms) {
+        SDL_FRect playerBox = Bounds();
+        if (AABBOverlap(playerBox, plat.Bounds()) && velocity.y >= 0.0f) {  // falling or standing
+            rect.y = plat.Bounds().y - rect.h;  // snap to top of platform
+            velocity.y = 0.0f;
+            // You can set a flag for 2x score here
+            onPlatform = true;
+            break;
+        }
+    }
+    this->onPlatform = onPlatform;
 }
 
 void Player::Render(SDL_Renderer *r) const {

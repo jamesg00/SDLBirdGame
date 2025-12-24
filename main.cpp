@@ -16,10 +16,15 @@
 #include "player/player.h"
 #include "collectables/coin.h"
 #include "core/sprite_anim.h"
+#include "core/floating_text.h"
+#include "core/platform.h"
+
+
+
 
 static SDL_Window *window = NULL;
 SDL_Renderer *renderer = NULL;
-static TTF_Font *font = nullptr;
+TTF_Font *font = nullptr;
 static SDL_Texture *textTex = nullptr;
 static SDL_Texture *bgTexture =  NULL;
 static SDL_Texture *psTextureL1 = NULL;
@@ -29,6 +34,8 @@ static SDL_Texture *psTextureL4 = NULL;
 static SDL_Texture *psTextureL5 = NULL;
 static SDL_Texture *arrowTex = nullptr;
 static SDL_Texture *cursorTex = nullptr;
+static std::vector<FloatingText> floatingTexts;
+std::vector<Platform> platforms;
 SDL_Texture *coinFrames[4] = {nullptr};
 SDL_Texture *batMoveFrames[16] = {nullptr};
 SDL_Texture *batDeathFrames[8] = {nullptr};
@@ -36,6 +43,7 @@ static SDL_Texture *warningFrames[9] = {nullptr};
 static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
+static int score = 0;
 
 struct PausedLetter {
     SDL_Texture *tex = nullptr;
@@ -259,6 +267,9 @@ static void ResetGameState() {
     newRecord = false;
     showFlyHint = true;
     waitingForStart = true;
+    floatingTexts.clear();
+    score = 0;
+    platforms.clear();
 }
 
 
@@ -578,8 +589,15 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     nearTrees.Update(dt);
     nearTrees.Render(renderer, (float)kWinW);
 
+    for (auto &plat : platforms) plat.Update(dt);
+    for (auto &plat : platforms) plat.Render(renderer);
+    platforms.erase(std::remove_if(platforms.begin(), platforms.end(),
+        [](const Platform &p) { return !p.alive; }), platforms.end());
 
 
+    for (auto &ft : floatingTexts) ft.Update(dt);
+    for (auto &ft : floatingTexts) ft.Render(renderer);
+    floatingTexts.erase(std::remove_if(floatingTexts.begin(), floatingTexts.end(), [](const FloatingText &ft) { return !ft.alive; }), floatingTexts.end());
 
     if (IsPlayingActive()) {
         if (waitingForStart && flyKeyDown) {
@@ -638,7 +656,20 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 }
             }
 
+
+
+            if (rng() % 8 == 0) {  // ~12.5% chance
+                float platY = std::uniform_real_distribution<float>(100.0f, kWinH - 150.0f)(rng);
+                float platSpeed = std::uniform_real_distribution<float>(80.0f, 140.0f)(rng);
+                float amp = std::uniform_real_distribution<float>(20.0f, 40.0f)(rng);
+                float freq = std::uniform_real_distribution<float>(1.5f, 3.0f)(rng);
+                float phase = std::uniform_real_distribution<float>(0.0f, SDL_PI_F * 2.0f)(rng);
+                platforms.emplace_back(kWinW + 100.0f, platY, platSpeed, amp, freq, phase);
+            }
             coinSpawnInterval = intervalDist(rng);
+
+
+
         }
     }
 
@@ -801,7 +832,10 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 if (AABBOverlap(projBox, batBox)) {
                     b.Kill();
                     p.alive = false;
-                    break; // projectile consumed
+                    int points = player.onPlatform ? 2 : 1;
+                    score += points;
+                    floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});  // yellow "+1" or "+2"
+                    break;
                 }
             }
         }
