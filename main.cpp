@@ -660,6 +660,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 SDL_ShowCursor();
                 SDL_SetWindowMouseGrab(window, false);
             }
+            gSoundManager.PlaySound("coin");
             optionsFromPaused = false;
             last = SDL_GetPerformanceCounter();
             dt = 0.0f;
@@ -972,10 +973,12 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     if (gameState == GameState::Menu && mouseDown && !wasMouseDown) {
         if (btnStart.hover) {
+            gSoundManager.PlaySound("coin");
             ResetGameState();
             SDL_SetWindowMouseGrab(window, true);
             SDL_HideCursor();
         } else if (btnOptions.hover) {
+            gSoundManager.PlaySound("coin");
             optionsFromPaused = false;
             gameState = GameState::Options;
             SDL_ShowCursor();
@@ -1170,7 +1173,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
 
     // then draw
-    if (gameState != GameState::Menu) {
+    if (gameState != GameState::Menu && !(gameState == GameState::Options && !optionsFromPaused)) {
         player.Render(renderer);
 
         // Shield animation overlay
@@ -1559,7 +1562,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         }
 
         // demo player + arrow + demo shots
-        if (gameState == GameState::Menu) {
+        if (gameState == GameState::Menu || (gameState == GameState::Options && !optionsFromPaused)) {
             SDL_FRect demoRect{ demo.pos.x - 20.0f, demo.pos.y - 20.0f, 40.0f, 40.0f };
             SDL_Texture *demoTex = runningAnim.Current();
             if (SDL_fabsf(demo.vel.y) > 5.0f && flyingAnim.Current()) {
