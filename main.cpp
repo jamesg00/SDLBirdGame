@@ -952,7 +952,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             if (!p.alive) continue;
             SDL_FRect projBox = p.Bounds();
             for (auto &b : bats) {
-                if (!b.alive) continue;
+                if (!b.alive || b.state != BatState::Moving) continue;
                 SDL_FRect batBox = b.Bounds();
                 bool batOnScreen = AABBOverlap(batBox, screenRect);
                 if (!batOnScreen) continue;
