@@ -123,6 +123,69 @@ static void UpdateComboText() {
     UpdateCachedText(hudComboText, "Combo: " + std::to_string(comboCount), col);
 }
 
+// Render a per-letter wave title with a subtle drop shadow.
+static void RenderWaveTitle(const std::string &text, float centerX, float baseY) {
+    if (!font || text.empty()) return;
+
+    const float spacing = 2.0f;
+    int totalW = 0;
+    int maxH = 0;
+    for (char ch : text) {
+        char buf[2] = {ch, '\0'};
+        int lw = 0, lh = 0;
+        if (TTF_GetStringSize(font, buf, SDL_strlen(buf), &lw, &lh)) {
+            totalW += lw;
+            totalW += (int)spacing;
+            if (lh > maxH) maxH = lh;
+        }
+    }
+    if (totalW > 0) totalW -= (int)spacing; // remove trailing spacing
+
+    double t = (double)SDL_GetTicks() / 1000.0;
+    const float waveAmp = 6.0f;
+    const float waveFreq = 3.0f;
+    const float phaseStep = 0.5f;
+    const float shadowOffset = 3.0f;
+
+    float x = centerX - (float)totalW * 0.5f;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char buf[2] = {text[i], '\0'};
+        SDL_Color white{255, 255, 255, 255};
+        SDL_Color shadow{0, 0, 0, 180};
+
+        SDL_Surface *surfShadow = TTF_RenderText_Blended(font, buf, 1, shadow);
+        SDL_Surface *surfMain = TTF_RenderText_Blended(font, buf, 1, white);
+        if (!surfMain) {
+            if (surfShadow) SDL_DestroySurface(surfShadow);
+            continue;
+        }
+
+        float waveY = SDL_sinf((float)t * waveFreq + phaseStep * (float)i) * waveAmp;
+        float y = baseY + waveY;
+
+        SDL_Texture *texShadow = surfShadow ? SDL_CreateTextureFromSurface(renderer, surfShadow) : nullptr;
+        SDL_Texture *texMain = SDL_CreateTextureFromSurface(renderer, surfMain);
+        float w = (float)surfMain->w;
+        float h = (float)surfMain->h;
+
+        if (texShadow) {
+            SDL_FRect dst{ x + shadowOffset, y + shadowOffset, w, h };
+            SDL_RenderTexture(renderer, texShadow, nullptr, &dst);
+        }
+        if (texMain) {
+            SDL_FRect dst{ x, y, w, h };
+            SDL_RenderTexture(renderer, texMain, nullptr, &dst);
+        }
+
+        if (texShadow) SDL_DestroyTexture(texShadow);
+        if (texMain) SDL_DestroyTexture(texMain);
+        SDL_DestroySurface(surfMain);
+        if (surfShadow) SDL_DestroySurface(surfShadow);
+
+        x += w + spacing;
+    }
+}
+
 
 static void RenderLabel(const std::string &text, float x, float y) {
     if (!font || text.empty()) return;
@@ -420,7 +483,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 
     // Precache static labels
     SDL_Color white{255,255,255,255};
-    UpdateCachedText(menuTitleText, "BIRD GAME", white);
+    UpdateCachedText(menuTitleText, "Arr0wB1rd", white);
     UpdateCachedText(menuStartText, "START", white);
     UpdateCachedText(menuOptionsText, "OPTIONS", white);
     UpdateCachedText(overTitleText, "GAME OVER!", white);
@@ -1311,11 +1374,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     // Menu
     if (gameState == GameState::Menu) {
         double t = (double)SDL_GetTicks() / 1000.0;
-        float titleWave = SDL_sinf((float)t * 2.2f) * 4.0f;
-        if (menuTitleText.tex) {
-            SDL_FRect dst{ kWinW * 0.5f - menuTitleText.w * 0.5f, 46.0f + titleWave, menuTitleText.w, menuTitleText.h };
-            SDL_RenderTexture(renderer, menuTitleText.tex, nullptr, &dst);
-        }
+        RenderWaveTitle("Arr0wb1rd", kWinW * 0.5f, 46.0f);
 
         // buttons with sine wobble and hover blink
         btnStart.bounds.w = menuStartText.w;
