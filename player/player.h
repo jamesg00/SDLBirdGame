@@ -44,6 +44,7 @@ private:
 
     static constexpr float kGravity = 900.0f;
     static constexpr float kJumpImpulse = -350.0f;
+    static constexpr float kDiveAccel = 1200.0f;
     static constexpr float kFloorY = 480.0f;
 
     bool autopilot = false;

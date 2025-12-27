@@ -29,6 +29,7 @@ void Player::Update(float dt) {
     bool leftDown = keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT];
     bool rightDown = keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT];
     bool spaceDown = keys[SDL_SCANCODE_SPACE] || keys[SDL_SCANCODE_W];
+    bool downDown = keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN];
 
     if (autopilot && spaceDown) {
         autopilot = false;
@@ -80,6 +81,9 @@ void Player::Update(float dt) {
 
     // Gravity and integration
     velocity.y += kGravity * dt;
+    if (!autopilot && downDown) {
+        velocity.y += kDiveAccel * dt; // intentional dive for quick drops
+    }
     rect.x += velocity.x * dt;
     rect.y += velocity.y * dt;
 

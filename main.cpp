@@ -42,6 +42,11 @@ SDL_Texture *coinFrames[4] = {nullptr};
 SDL_Texture *batMoveFrames[16] = {nullptr};
 SDL_Texture *batDeathFrames[8] = {nullptr};
 static SDL_Texture *warningFrames[9] = {nullptr};
+static SDL_Texture *shieldFrames[97] = {nullptr};
+static const int kShieldFrameCount = 97;
+static float shieldAnimTimer = 0.0f;
+static int shieldAnimFrame = 0;
+static const float kShieldFrameTime = 0.04f;
 static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
@@ -105,7 +110,7 @@ static void UpdateCachedText(CachedText &ct, const std::string &s, SDL_Color col
         ct.color.r == col.r && ct.color.g == col.g && ct.color.b == col.b && ct.color.a == col.a) return;
     DestroyCached(ct);
     if (!font) return;
-    SDL_Surface *surf = TTF_RenderText_Blended(font, s.c_str(), (int)s.size(), col);
+    SDL_Surface *surf = TTF_RenderText_Blended(font, s.c_str(), 0, col);
     if (!surf) return;
     SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
     if (tex && SDL_GetTextureSize(tex, &ct.w, &ct.h)) {
@@ -153,8 +158,8 @@ static void RenderWaveTitle(const std::string &text, float centerX, float baseY)
         SDL_Color white{255, 255, 255, 255};
         SDL_Color shadow{0, 0, 0, 180};
 
-        SDL_Surface *surfShadow = TTF_RenderText_Blended(font, buf, 1, shadow);
-        SDL_Surface *surfMain = TTF_RenderText_Blended(font, buf, 1, white);
+        SDL_Surface *surfShadow = TTF_RenderText_Blended(font, buf, 0, shadow);
+        SDL_Surface *surfMain = TTF_RenderText_Blended(font, buf, 0, white);
         if (!surfMain) {
             if (surfShadow) SDL_DestroySurface(surfShadow);
             continue;
@@ -193,7 +198,7 @@ static void RenderLabel(const std::string &text, float x, float y) {
     SDL_Color shadow{0, 0, 0, 160};
 
     auto makeTex = [&](SDL_Color col) -> SDL_Texture* {
-        SDL_Surface *surf = TTF_RenderText_Blended(font, text.c_str(), (int)text.size(), col);
+        SDL_Surface *surf = TTF_RenderText_Blended(font, text.c_str(), 0, col);
         if (!surf) return nullptr;
         SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
         SDL_DestroySurface(surf);
@@ -222,7 +227,7 @@ static bool LoadPausedLetters(SDL_Renderer *r, TTF_Font *f) {
     SDL_Color white{255, 255, 255, 255};
     for (int i = 0; i < 6; ++i) {
         char cstr[2] = {word[i], '\0'};
-        SDL_Surface *surf = TTF_RenderText_Blended(f, cstr, 1, white);
+        SDL_Surface *surf = TTF_RenderText_Blended(f, cstr, 0, white);
         if (!surf) return false;
         pausedLetters[i].tex = SDL_CreateTextureFromSurface(r, surf);
         pausedLetters[i].w = (float)surf->w;
@@ -301,7 +306,6 @@ static float bestTime = 0.0f;
 
 
 static bool newRecord = false;
-static bool soundMuted = false;
 SpriteAnim runningAnim;
 SpriteAnim flyingAnim;
 Player player;
@@ -312,6 +316,11 @@ inline bool IsPlayingActive() { return gameState == GameState::Playing && !playe
 
 static int hudLastCoins = -1;
 static int hudLastTime = -1;
+static float musicVolumeSetting = 0.35f; // 0..1
+static float sfxVolumeSetting = 1.0f;    // 0..1
+static bool draggingMusicSlider = false;
+static bool draggingSfxSlider = false;
+static bool optionsFromPaused = false;
 struct MenuButton {
     std::string label;
     SDL_FRect bounds{0,0,0,0};
@@ -397,6 +406,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     gSoundManager.LoadSound("shoot", "assets/sounds/shoot.wav");
     gSoundManager.LoadSound("bat_hit", "assets/sounds/bat_hit.wav");
     gSoundManager.LoadSound("coin", "assets/sounds/coin.wav");
+    gSoundManager.SetSfxVolume(sfxVolumeSetting);
+    gSoundManager.PlayMusic("assets/sounds/bgMusic.wav", musicVolumeSetting);
 
     if (!SDL_CreateWindowAndRenderer("ILUVMUSIC", kWinW, kWinH, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
         SDL_Log("Couldn't create window/renderer: %s", SDL_GetError());
@@ -470,7 +481,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 
 
 
-    font = TTF_OpenFont("ARCADECLASSIC.ttf", 32);
+    font = TTF_OpenFont("BoldPixels.ttf", 32);
     if (!font) {
         SDL_Log("Failed to load font: %s", SDL_GetError());
         return SDL_APP_FAILURE;
@@ -557,6 +568,11 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 
     magnetTex = IMG_LoadTexture(renderer, "assets/magnet.png");
     shieldTex = IMG_LoadTexture(renderer, "assets/shield.png");
+    for (int i = 0; i < kShieldFrameCount; ++i) {
+        char file[64];
+        SDL_snprintf(file, sizeof(file), "assets/frames/frame%04d.png", i + 1);
+        shieldFrames[i] = IMG_LoadTexture(renderer, file);
+    }
 
     player.Init();
 
@@ -593,6 +609,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
 
     SDL_RenderClear(renderer);
+    gSoundManager.Update();
 
     //key
     input.Update();
@@ -634,16 +651,24 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             last = SDL_GetPerformanceCounter();
             dt = 0.0f;
         } else if (gameState == GameState::Options) {
-            gameState = GameState::Menu;
-            SDL_ShowCursor();
-            SDL_SetWindowMouseGrab(window, false);
+            if (optionsFromPaused) {
+                gameState = GameState::Paused;
+                SDL_ShowCursor();
+                SDL_SetWindowMouseGrab(window, false);
+            } else {
+                gameState = GameState::Menu;
+                SDL_ShowCursor();
+                SDL_SetWindowMouseGrab(window, false);
+            }
+            optionsFromPaused = false;
             last = SDL_GetPerformanceCounter();
             dt = 0.0f;
         }
     }
     wasEscapeDown = escapeDown;
 
-    if (playerDead || player.dead || gameState == GameState::Paused || gameState == GameState::Options) {
+    if (playerDead || player.dead || gameState == GameState::Paused ||
+        (gameState == GameState::Options && optionsFromPaused)) {
         dt = 0.0f;
     }
 
@@ -658,7 +683,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     }
 
     // Demo motion in menu (simple sine path with anim swap on vertical movement)
-    if (gameState == GameState::Menu) {
+    if (gameState == GameState::Menu || (gameState == GameState::Options && !optionsFromPaused)) {
         float prevX = demo.pos.x;
         float prevY = demo.pos.y;
         demo.t += dt;
@@ -832,6 +857,16 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         shieldTimer -= dt;
         if (shieldTimer <= 0.0f) { shieldActive = false; shieldTimer = 0.0f; }
     }
+    if (shieldActive && dt > 0.0f) {
+        shieldAnimTimer += dt;
+        while (shieldAnimTimer >= kShieldFrameTime) {
+            shieldAnimTimer -= kShieldFrameTime;
+            shieldAnimFrame = (shieldAnimFrame + 1) % kShieldFrameCount;
+        }
+    } else {
+        shieldAnimFrame = 0;
+        shieldAnimTimer = 0.0f;
+    }
     if (spreadActive) {
         spreadTimer -= dt;
         if (spreadTimer <= 0.0f) { spreadActive = false; spreadTimer = 0.0f; }
@@ -891,27 +926,24 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         }
         bats.erase(std::remove_if(bats.begin(), bats.end(), [](const Bat &b){ return !b.alive; }), bats.end());
 
-        // collect warnings for approaching off-screen bats near player's edge
-        float pcx = target.x;
-        float pcy = target.y;
+        // collect warnings for approaching off-screen bats
         float warnMargin = 18.0f;
+        const float offscreenMargin = 32.0f; // small buffer to consider offscreen
+        SDL_FRect screenRect{0.0f, 0.0f, (float)kWinW, (float)kWinH};
         for (auto &b : bats) {
             if (!b.alive || b.state != BatState::Moving) continue;
-            bool offLeft = b.pos.x < -40.0f;
-            bool offRight = b.pos.x > kWinW + 40.0f;
-            bool offTop = b.pos.y < -40.0f;
-            bool offBot = b.pos.y > kWinH + 40.0f;
+            SDL_FRect batBox = b.Bounds();
+            if (AABBOverlap(batBox, screenRect)) continue; // already on screen
+
+            bool offLeft = batBox.x + batBox.w < -offscreenMargin;
+            bool offRight = batBox.x > kWinW + offscreenMargin;
+            bool offTop = batBox.y + batBox.h < -offscreenMargin;
+            bool offBot = batBox.y > kWinH + offscreenMargin;
             if (!(offLeft || offRight || offTop || offBot)) continue;
 
-            bool headingIn = (offLeft && b.vel.x > 0) || (offRight && b.vel.x < 0) ||
-                             (offTop && b.vel.y > 0) || (offBot && b.vel.y < 0);
+            bool headingIn = (offLeft && b.vel.x > 0.0f) || (offRight && b.vel.x < 0.0f) ||
+                             (offTop && b.vel.y > 0.0f) || (offBot && b.vel.y < 0.0f);
             if (!headingIn) continue;
-
-            bool playerNearEdge = (offLeft && pcx < 140.0f) ||
-                                  (offRight && pcx > kWinW - 140.0f) ||
-                                  (offTop && pcy < 140.0f) ||
-                                  (offBot && pcy > kWinH - 140.0f);
-            if (!playerNearEdge) continue;
 
             float w = 40.0f, h = 40.0f;
             SDL_FRect icon{0,0,w,h};
@@ -944,23 +976,64 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             SDL_SetWindowMouseGrab(window, true);
             SDL_HideCursor();
         } else if (btnOptions.hover) {
+            optionsFromPaused = false;
             gameState = GameState::Options;
             SDL_ShowCursor();
             SDL_SetWindowMouseGrab(window, false);
         }
     }
 
-    if (gameState == GameState::Options && mouseDown && !wasMouseDown) {
-        // toggle mute when clicking anywhere on the options label area
-        int w=0,h=0;
-        const char *label = soundMuted ? "Sound: Muted" : "Sound: On";
-        SDL_Surface *s = TTF_RenderText_Blended(font, label, SDL_strlen(label), SDL_Color{255,255,255,255});
-        if (s) { w = s->w; h = s->h; SDL_DestroySurface(s); }
-        float x = kWinW * 0.5f - w * 0.5f;
-        float y = kWinH * 0.5f;
-        if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
-            soundMuted = !soundMuted;
-            DestroyCached(optionsStateText);
+    if (gameState == GameState::Paused && mouseDown && !wasMouseDown) {
+        const char *optLabel = "OPTIONS";
+        int lw = 0, lh = 0;
+        float hitSpacing = 4.0f;
+        if (TTF_GetStringSize(font, optLabel, SDL_strlen(optLabel), &lw, &lh)) {
+            float totalW = (float)lw + hitSpacing * ((float)SDL_strlen(optLabel) - 1.0f);
+            float maxH = 0.0f;
+            for (int i = 0; i < 6; ++i) {
+                if (pausedLetters[i].h > maxH) maxH = pausedLetters[i].h;
+            }
+            float baseY = (kWinH - maxH) * 0.5f;
+            float textStart = kWinW * 0.5f - totalW * 0.5f;
+            float baseTextY = baseY + maxH + 18.0f;
+            float hitX = textStart;
+            float hitY = baseTextY - 4.0f;
+            float hitW = totalW;
+            float hitH = lh + 8.0f;
+            if (mx >= hitX && mx <= hitX + hitW && my >= hitY && my <= hitY + hitH) {
+                optionsFromPaused = true;
+                gameState = GameState::Options;
+                SDL_ShowCursor();
+                SDL_SetWindowMouseGrab(window, false);
+            }
+        }
+    }
+
+    if (gameState == GameState::Options) {
+        float sliderW = 180.0f;
+        float sliderX = kWinW * 0.5f - sliderW * 0.5f;
+        float musicY = kWinH * 0.5f - 10.0f;
+        float sfxY = musicY + 50.0f;
+
+        auto adjustFromMouse = [&](float y, bool &dragging, float &value, auto setter) {
+            float trackH = 16.0f;
+            float hitTop = y - trackH;
+            float hitBottom = y + trackH;
+            bool inside = (mx >= sliderX && mx <= sliderX + sliderW && my >= hitTop && my <= hitBottom);
+            if (mouseDown && !wasMouseDown && inside) dragging = true;
+            if (dragging && mouseDown) {
+                float t = ClampF((mx - sliderX) / sliderW, 0.0f, 1.0f);
+                value = t;
+                setter(t);
+            }
+        };
+
+        adjustFromMouse(musicY, draggingMusicSlider, musicVolumeSetting, [&](float v){ gSoundManager.SetMusicVolume(v); });
+        adjustFromMouse(sfxY, draggingSfxSlider, sfxVolumeSetting, [&](float v){ gSoundManager.SetSfxVolume(v); });
+
+        if (!mouseDown) {
+            draggingMusicSlider = false;
+            draggingSfxSlider = false;
         }
     }
 
@@ -1099,6 +1172,14 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     // then draw
     if (gameState != GameState::Menu) {
         player.Render(renderer);
+
+        // Shield animation overlay
+        if (shieldActive && shieldFrames[shieldAnimFrame]) {
+            SDL_FRect pbox = player.Bounds();
+            float sz = pbox.w + 18.0f;
+            SDL_FRect sdst{ pbox.x + pbox.w * 0.5f - sz * 0.5f, pbox.y + pbox.h * 0.5f - sz * 0.5f, sz, sz };
+            SDL_RenderTexture(renderer, shieldFrames[shieldAnimFrame], nullptr, &sdst);
+        }
 
         for (auto &b : bats) {
             b.Render(renderer);
@@ -1252,7 +1333,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             widths.reserve(comboStr.size());
             for (char ch : comboStr) {
                 char cstr[2] = {ch, '\0'};
-                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 1, SDL_Color{255,255,255,255});
+                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 0, SDL_Color{255,255,255,255});
                 float w = s ? (float)s->w : 0.0f;
                 widths.push_back(w);
                 totalW += w + spacing;
@@ -1269,7 +1350,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     col.g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 0.6f * (float)i + 2.0f));
                     col.b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 0.6f * (float)i + 4.0f));
                 }
-                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 1, col);
+                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 0, col);
                 if (!s) continue;
                 SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, s);
                 float w = (float)s->w;
@@ -1296,7 +1377,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             const float freq = 2.2f;
             double tNow = (double)SDL_GetTicks() / 1000.0;
 
-            SDL_Surface *s = TTF_RenderText_Blended(font, hint, (int)SDL_strlen(hint), SDL_Color{255,255,255,255});
+            SDL_Surface *s = TTF_RenderText_Blended(font, hint, 0, SDL_Color{255,255,255,255});
             if (s) {
                 SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, s);
                 if (tex) {
@@ -1323,11 +1404,21 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         if (magnetActive && magnetTex) {
             SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
             SDL_RenderTexture(renderer, magnetTex, nullptr, &dst);
+            if (magnetTimer > 0.0f) {
+                char buf[16];
+                SDL_snprintf(buf, sizeof(buf), "%.1fs", magnetTimer);
+                RenderLabel(buf, dst.x + iconSize + 8.0f, dst.y + 2.0f);
+            }
             puY += iconSize + 6.0f;
         }
         if (shieldActive && shieldTex) {
             SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
             SDL_RenderTexture(renderer, shieldTex, nullptr, &dst);
+            if (shieldTimer > 0.0f) {
+                char buf[16];
+                SDL_snprintf(buf, sizeof(buf), "%.1fs", shieldTimer);
+                RenderLabel(buf, dst.x + iconSize + 8.0f, dst.y + 2.0f);
+            }
             puY += iconSize + 6.0f;
         }
         if (spreadActive && magnetTex) {
@@ -1369,14 +1460,59 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             }
             x += pausedLetters[i].w + spacing;
         }
+        // Options text while paused with same wave feel as PAUSED
+        const char *optLabel = "OPTIONS";
+        int lw = 0, lh = 0;
+        float optSpacing = 4.0f;
+        if (TTF_GetStringSize(font, optLabel, SDL_strlen(optLabel), &lw, &lh)) {
+            float totalW = (float)lw + optSpacing * ((float)SDL_strlen(optLabel) - 1.0f);
+            float textStart = kWinW * 0.5f - totalW * 0.5f;
+            float baseTextY = baseY + maxH + 18.0f;
+            float hitX = textStart;
+            float hitY = baseTextY - 4.0f;
+            float hitW = totalW;
+            float hitH = lh + 8.0f;
+            bool optHover = (mx >= hitX && mx <= hitX + hitW && my >= hitY && my <= hitY + hitH);
+            Uint8 mainAlpha = optHover ? 255 : 180;
+            Uint8 shadowAlpha = optHover ? 220 : 160;
+            float tx = textStart;
+            float waveAmp = pausedWaveAmp;
+            float waveFreq = pausedWaveFreq;
+            for (size_t i = 0; i < SDL_strlen(optLabel); ++i) {
+                char cbuf[2] = {optLabel[i], '\0'};
+                SDL_Color shadow{0,0,0,shadowAlpha};
+                SDL_Color mainCol{255,255,255,mainAlpha};
+                SDL_Surface *ss = TTF_RenderText_Blended(font, cbuf, 0, shadow);
+                SDL_Surface *sm = TTF_RenderText_Blended(font, cbuf, 0, mainCol);
+                if (!sm) { if (ss) SDL_DestroySurface(ss); continue; }
+                float waveY = SDL_sinf((float)(t * waveFreq + pausedWavePhaseStep * (float)i)) * waveAmp;
+                float w = (float)sm->w;
+                float h = (float)sm->h;
+                SDL_Texture *ts = ss ? SDL_CreateTextureFromSurface(renderer, ss) : nullptr;
+                SDL_Texture *tm = SDL_CreateTextureFromSurface(renderer, sm);
+                if (ts) {
+                    SDL_FRect dst{ tx + 2.0f, baseTextY + waveY + 2.0f, w, h };
+                    SDL_RenderTexture(renderer, ts, nullptr, &dst);
+                }
+                if (tm) {
+                    SDL_FRect dst{ tx, baseTextY + waveY, w, h };
+                    SDL_RenderTexture(renderer, tm, nullptr, &dst);
+                }
+                if (ts) SDL_DestroyTexture(ts);
+                if (tm) SDL_DestroyTexture(tm);
+                SDL_DestroySurface(sm);
+                if (ss) SDL_DestroySurface(ss);
+                tx += w + optSpacing;
+            }
+        }
     }
 
     // Menu
-    if (gameState == GameState::Menu) {
+    if (gameState == GameState::Menu || (gameState == GameState::Options && !optionsFromPaused)) {
         double t = (double)SDL_GetTicks() / 1000.0;
         RenderWaveTitle("Arr0wb1rd", kWinW * 0.5f, 46.0f);
 
-        // buttons with sine wobble and hover blink
+        // buttons with sine wobble and hover blink (only interactable in menu)
         btnStart.bounds.w = menuStartText.w;
         btnStart.bounds.h = menuStartText.h;
         btnStart.bounds.x = kWinW * 0.5f - btnStart.bounds.w * 0.5f;
@@ -1393,8 +1529,12 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             b.hover = (mx >= b.bounds.x && mx <= b.bounds.x + b.bounds.w &&
                        my >= b.bounds.y && my <= b.bounds.y + b.bounds.h);
         };
-        hoverCheck(btnStart);
-        hoverCheck(btnOptions);
+        if (gameState == GameState::Menu) {
+            hoverCheck(btnStart);
+            hoverCheck(btnOptions);
+        } else {
+            btnStart.hover = btnOptions.hover = false;
+        }
 
         auto renderButton = [&](const MenuButton &b, float phase){
             float hoverWave = b.hover ? SDL_sinf((float)t * 4.0f + phase) * 4.0f : 0.0f;
@@ -1413,40 +1553,76 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 SDL_RenderTexture(renderer, ct->tex, nullptr, &dst);
             }
         };
-        renderButton(btnStart, 0.0f);
-        renderButton(btnOptions, 1.0f);
+        if (gameState == GameState::Menu) {
+            renderButton(btnStart, 0.0f);
+            renderButton(btnOptions, 1.0f);
+        }
 
         // demo player + arrow + demo shots
-        SDL_FRect demoRect{ demo.pos.x - 20.0f, demo.pos.y - 20.0f, 40.0f, 40.0f };
-        SDL_Texture *demoTex = runningAnim.Current();
-        if (SDL_fabsf(demo.vel.y) > 5.0f && flyingAnim.Current()) {
-            demoTex = flyingAnim.Current();
-        }
-        if (demoTex) {
-            SDL_RenderTextureRotated(renderer, demoTex, nullptr, &demoRect, 0.0, nullptr, SDL_FLIP_NONE);
-        }
-        for (auto &dp : demoProjectiles) {
-            dp.Render(renderer);
-        }
-        if (arrowTex) {
-            float radius = 30.0f;
-            float ax = demo.pos.x + SDL_cosf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
-            float ay = demo.pos.y + SDL_sinf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
-            SDL_FRect adst{ ax - 16.0f, ay - 16.0f, 32.0f, 32.0f };
-            SDL_RenderTextureRotated(renderer, arrowTex, nullptr, &adst, demo.angleDeg, nullptr, SDL_FLIP_NONE);
+        if (gameState == GameState::Menu) {
+            SDL_FRect demoRect{ demo.pos.x - 20.0f, demo.pos.y - 20.0f, 40.0f, 40.0f };
+            SDL_Texture *demoTex = runningAnim.Current();
+            if (SDL_fabsf(demo.vel.y) > 5.0f && flyingAnim.Current()) {
+                demoTex = flyingAnim.Current();
+            }
+            if (demoTex) {
+                SDL_RenderTextureRotated(renderer, demoTex, nullptr, &demoRect, 0.0, nullptr, SDL_FLIP_NONE);
+            }
+            for (auto &dp : demoProjectiles) {
+                dp.Render(renderer);
+            }
+            if (arrowTex) {
+                float radius = 30.0f;
+                float ax = demo.pos.x + SDL_cosf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
+                float ay = demo.pos.y + SDL_sinf(demo.angleDeg * SDL_PI_F/180.0f) * radius;
+                SDL_FRect adst{ ax - 16.0f, ay - 16.0f, 32.0f, 32.0f };
+                SDL_RenderTextureRotated(renderer, arrowTex, nullptr, &adst, demo.angleDeg, nullptr, SDL_FLIP_NONE);
+            }
         }
     }
 
-    // Options placeholder
+    // Options with volume sliders
     if (gameState == GameState::Options) {
         SDL_Color white{255,255,255,255};
-        UpdateCachedText(optionsStateText, soundMuted ? "Sound: Muted" : "Sound: On", white);
-        RenderLabel("OPTIONS", kWinW * 0.5f - 70.0f, kWinH * 0.5f - 40.0f);
+        UpdateCachedText(optionsStateText, "Adjust volumes", white);
+        RenderLabel("OPTIONS", kWinW * 0.5f - 70.0f, kWinH * 0.5f - 110.0f);
+        float sliderW = 180.0f;
+        float sliderX = kWinW * 0.5f - sliderW * 0.5f;
+        float musicY = kWinH * 0.5f - 6.0f;
+        float sfxY = musicY + 48.0f;
+
+        auto drawSlider = [&](const char *label, float value, float y) {
+            RenderLabel(label, sliderX - 110.0f, y - 10.0f);
+            SDL_FRect track{ sliderX, y, sliderW, 10.0f };
+            SDL_SetRenderDrawColor(renderer, 20, 20, 30, 200);
+            SDL_RenderFillRect(renderer, &track);
+            SDL_FRect fill{ sliderX, y, sliderW * value, 10.0f };
+            SDL_SetRenderDrawColor(renderer, 90, 180, 255, 230);
+            SDL_RenderFillRect(renderer, &fill);
+            float knobW = 14.0f;
+            SDL_FRect knob{ sliderX + sliderW * value - knobW * 0.5f, y - 2.0f, knobW, 14.0f };
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+            SDL_RenderFillRect(renderer, &knob);
+            char pct[16];
+            SDL_snprintf(pct, sizeof(pct), "%3d%%", (int)SDL_roundf(value * 100.0f));
+            RenderLabel(pct, sliderX + sliderW + 14.0f, y - 6.0f);
+        };
+
+        drawSlider("Music", musicVolumeSetting, musicY);
+        drawSlider("FX", sfxVolumeSetting, sfxY);
+
         if (optionsStateText.tex) {
-            SDL_FRect dst{ kWinW * 0.5f - optionsStateText.w * 0.5f, kWinH * 0.5f, optionsStateText.w, optionsStateText.h };
+            SDL_FRect shadow{ kWinW * 0.5f - optionsStateText.w * 0.5f + 2.0f, kWinH * 0.5f - 52.0f + 2.0f, optionsStateText.w, optionsStateText.h };
+            SDL_SetTextureColorMod(optionsStateText.tex, 0,0,0);
+            SDL_SetTextureAlphaMod(optionsStateText.tex, 200);
+            SDL_RenderTexture(renderer, optionsStateText.tex, nullptr, &shadow);
+            SDL_SetTextureColorMod(optionsStateText.tex, 255,255,255);
+            SDL_SetTextureAlphaMod(optionsStateText.tex, 255);
+            SDL_FRect dst{ kWinW * 0.5f - optionsStateText.w * 0.5f, kWinH * 0.5f - 52.0f, optionsStateText.w, optionsStateText.h };
             SDL_RenderTexture(renderer, optionsStateText.tex, nullptr, &dst);
         }
-        RenderLabel("ESC to return", kWinW * 0.5f - 90.0f, kWinH * 0.5f + 30.0f);
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        RenderLabel("ESC to return", kWinW * 0.5f - 90.0f, kWinH * 0.5f + 120.0f);
     }
 
     // Game over overlay
@@ -1515,6 +1691,12 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     if (psTextureL5) { SDL_DestroyTexture(psTextureL5); psTextureL5 = NULL; }
     if (magnetTex) { SDL_DestroyTexture(magnetTex); magnetTex = nullptr; }
     if (shieldTex) { SDL_DestroyTexture(shieldTex); shieldTex = nullptr; }
+    for (int i = 0; i < kShieldFrameCount; ++i) {
+        if (shieldFrames[i]) {
+            SDL_DestroyTexture(shieldFrames[i]);
+            shieldFrames[i] = nullptr;
+        }
+    }
 
     runningAnim.DestroyFrames();
     flyingAnim.DestroyFrames();
