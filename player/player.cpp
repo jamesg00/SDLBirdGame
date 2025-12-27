@@ -1,4 +1,5 @@
 #include "player.h"
+#include "../audio/audio.h"
 #include <cmath>
 
 void Player::Init() {
@@ -69,6 +70,7 @@ void Player::Update(float dt) {
     }
 
     if (spaceDown && !wasSpaceDown) {
+        gSoundManager.PlaySound("jump");
         velocity.y = kJumpImpulse;
         flyingLoopsRemaining = 1;
         animState = AnimState::Flying;
@@ -142,23 +144,20 @@ void Player::Update(float dt) {
             float angle = SDL_atan2(dy, dx) * (180.0f / SDL_PI_D);
 
             projectiles.emplace_back(pcx, pcy, vx, vy, angle);
+            if (spreadActive) {
+                const float spreadDeg = 14.0f;
+                float radLeft = (angle - spreadDeg) * SDL_PI_F / 180.0f;
+                float radRight = (angle + spreadDeg) * SDL_PI_F / 180.0f;
+                float vxL = SDL_cosf(radLeft) * speed;
+                float vyL = SDL_sinf(radLeft) * speed;
+                float vxR = SDL_cosf(radRight) * speed;
+                float vyR = SDL_sinf(radRight) * speed;
+                projectiles.emplace_back(pcx, pcy, vxL, vyL, angle - spreadDeg);
+                projectiles.emplace_back(pcx, pcy, vxR, vyR, angle + spreadDeg);
+            }
         }
     }
     wasMouseDown = mouseDown;
-
-    bool onPlatform = false;
-
-    for (const auto &plat : platforms) {
-        SDL_FRect playerBox = Bounds();
-        if (AABBOverlap(playerBox, plat.Bounds()) && velocity.y >= 0.0f) {  // falling or standing
-            rect.y = plat.Bounds().y - rect.h;  // snap to top of platform
-            velocity.y = 0.0f;
-            // You can set a flag for 2x score here
-            onPlatform = true;
-            break;
-        }
-    }
-    this->onPlatform = onPlatform;
 }
 
 void Player::Render(SDL_Renderer *r) const {

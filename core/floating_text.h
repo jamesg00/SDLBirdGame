@@ -5,10 +5,8 @@
 #include <SDL3_ttf/SDL_ttf.h>
 #include <string>
 #include <vector>
-#include "../core/platform.h"
 
 extern TTF_Font *font;  // from main.cpp
-extern std::vector<Platform> platforms;
 
 struct FloatingText {
     SDL_FPoint pos;

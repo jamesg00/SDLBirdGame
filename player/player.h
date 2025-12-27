@@ -6,7 +6,6 @@
 #include "../core/sprite_anim.h"
 #include "../core/utils.h"
 #include "../core/projectile.h"
-#include "../core/platform.h"
 #include <vector>
 
 // Animations and projectile pool are owned in main.cpp.
@@ -14,8 +13,8 @@ extern SpriteAnim runningAnim;
 extern SpriteAnim flyingAnim;
 extern std::vector<Projectile> projectiles;
 extern bool playerDead;
-extern std::vector<Platform> platforms;
 extern TTF_Font *font;
+extern bool spreadActive;
 
 enum class AnimState {
     Running,
@@ -33,7 +32,6 @@ struct Player {
     SDL_FPoint Center() const;
 
     bool dead = false;
-    bool onPlatform = false;
 
 private:
     SDL_FRect rect{300.0f, 50.0f, 40.0f, 40.0f};

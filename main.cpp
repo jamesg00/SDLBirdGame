@@ -17,7 +17,7 @@
 #include "collectables/coin.h"
 #include "core/sprite_anim.h"
 #include "core/floating_text.h"
-#include "core/platform.h"
+#include "audio/audio.h"
 
 
 
@@ -34,8 +34,10 @@ static SDL_Texture *psTextureL4 = NULL;
 static SDL_Texture *psTextureL5 = NULL;
 static SDL_Texture *arrowTex = nullptr;
 static SDL_Texture *cursorTex = nullptr;
+static SDL_Texture *magnetTex = nullptr;
+static SDL_Texture *shieldTex = nullptr;
+
 static std::vector<FloatingText> floatingTexts;
-std::vector<Platform> platforms;
 SDL_Texture *coinFrames[4] = {nullptr};
 SDL_Texture *batMoveFrames[16] = {nullptr};
 SDL_Texture *batDeathFrames[8] = {nullptr};
@@ -44,6 +46,15 @@ static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
 static int score = 0;
+static int comboCount = 0;
+static float comboTimer = 0.0f;
+static const float comboTimeout = 3.0f;
+static bool magnetActive = false;
+static float magnetTimer = 0.0f;
+static bool shieldActive = false;
+static float shieldTimer = 0.0f;
+bool spreadActive = false;
+static float spreadTimer = 0.0f;
 
 struct PausedLetter {
     SDL_Texture *tex = nullptr;
@@ -68,7 +79,20 @@ struct CachedText {
     float w = 0.0f;
     float h = 0.0f;
     std::string text;
+    SDL_Color color{255,255,255,255};
 };
+
+static CachedText hudCoinText;
+static CachedText hudTimeText;
+static CachedText hudComboText;
+static CachedText menuTitleText;
+static CachedText menuStartText;
+static CachedText menuOptionsText;
+static CachedText optionsStateText;
+static CachedText overTitleText;
+static CachedText overCoinsText;
+static CachedText overTimeText;
+static CachedText newRecordText;
 
 static void DestroyCached(CachedText &ct) {
     if (ct.tex) { SDL_DestroyTexture(ct.tex); ct.tex = nullptr; }
@@ -77,7 +101,8 @@ static void DestroyCached(CachedText &ct) {
 }
 
 static void UpdateCachedText(CachedText &ct, const std::string &s, SDL_Color col) {
-    if (s == ct.text && ct.tex) return;
+    if (s == ct.text && ct.tex &&
+        ct.color.r == col.r && ct.color.g == col.g && ct.color.b == col.b && ct.color.a == col.a) return;
     DestroyCached(ct);
     if (!font) return;
     SDL_Surface *surf = TTF_RenderText_Blended(font, s.c_str(), (int)s.size(), col);
@@ -86,10 +111,16 @@ static void UpdateCachedText(CachedText &ct, const std::string &s, SDL_Color col
     if (tex && SDL_GetTextureSize(tex, &ct.w, &ct.h)) {
         ct.tex = tex;
         ct.text = s;
+        ct.color = col;
     } else {
         if (tex) SDL_DestroyTexture(tex);
     }
     SDL_DestroySurface(surf);
+}
+
+static void UpdateComboText() {
+    SDL_Color col{255, 255, 255, 255};
+    UpdateCachedText(hudComboText, "Combo: " + std::to_string(comboCount), col);
 }
 
 
@@ -216,22 +247,8 @@ static bool waitingForStart = true;
 inline bool IsPlayingActive() { return gameState == GameState::Playing && !playerDead && !player.dead; }
 
 
-static CachedText hudCoinText;
-static CachedText hudTimeText;
-
-
 static int hudLastCoins = -1;
 static int hudLastTime = -1;
-
-
-static CachedText menuTitleText;
-static CachedText menuStartText;
-static CachedText menuOptionsText;
-static CachedText optionsStateText;
-static CachedText overTitleText;
-static CachedText overCoinsText;
-static CachedText overTimeText;
-static CachedText newRecordText;
 struct MenuButton {
     std::string label;
     SDL_FRect bounds{0,0,0,0};
@@ -248,6 +265,22 @@ struct Demo {
 } static demo;
 static std::vector<DemoProjectile> demoProjectiles;
 static float demoShotTimer = 0.0f;
+
+enum class PowerupType { Magnet, Shield, Spread };
+struct Powerup {
+    PowerupType type;
+    SDL_FPoint pos;
+    bool alive = true;
+    float ttl = 12.0f;
+    float speed = 0.0f;
+    float amp = 0.0f;
+    float freq = 0.0f;
+    float phase = 0.0f;
+    float t = 0.0f;
+};
+static std::vector<Powerup> powerups;
+static float powerupSpawnTimer = 0.0f;
+static float powerupSpawnInterval = 10.0f;
 
 static void ResetGameState() {
     player.Reset();
@@ -269,7 +302,16 @@ static void ResetGameState() {
     waitingForStart = true;
     floatingTexts.clear();
     score = 0;
-    platforms.clear();
+    comboCount = 0;
+    comboTimer = 0.0f;
+    DestroyCached(hudComboText);
+    magnetActive = false;
+    shieldActive = false;
+    spreadActive = false;
+    magnetTimer = shieldTimer = spreadTimer = 0.0f;
+    powerups.clear();
+    powerupSpawnTimer = 0.0f;
+    powerupSpawnInterval = 10.0f;
 }
 
 
@@ -278,10 +320,20 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
     SDL_SetAppMetadata("Example Renderer Clear", "1.0", "com.example.renderer-clear");
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         SDL_Log("Couldn't initialize SDL: %s", SDL_GetError());
         return SDL_APP_FAILURE;
     }
+
+    if (!gSoundManager.Init()) {
+        SDL_Log("Couldn't initialize audio: %s", SDL_GetError());
+    }
+
+    // Load your sounds
+    gSoundManager.LoadSound("jump", "assets/sounds/jump.wav");
+    gSoundManager.LoadSound("shoot", "assets/sounds/shoot.wav");
+    gSoundManager.LoadSound("bat_hit", "assets/sounds/bat_hit.wav");
+    gSoundManager.LoadSound("coin", "assets/sounds/coin.wav");
 
     if (!SDL_CreateWindowAndRenderer("ILUVMUSIC", kWinW, kWinH, SDL_WINDOW_RESIZABLE, &window, &renderer)) {
         SDL_Log("Couldn't create window/renderer: %s", SDL_GetError());
@@ -440,6 +492,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     flyingAnim.Init(0.08f, 5);
     flyingAnim.LoadFrames("assets/Flying/Flying", 5, renderer);
 
+    magnetTex = IMG_LoadTexture(renderer, "assets/magnet.png");
+    shieldTex = IMG_LoadTexture(renderer, "assets/shield.png");
+
     player.Init();
 
 
@@ -589,12 +644,6 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     nearTrees.Update(dt);
     nearTrees.Render(renderer, (float)kWinW);
 
-    for (auto &plat : platforms) plat.Update(dt);
-    for (auto &plat : platforms) plat.Render(renderer);
-    platforms.erase(std::remove_if(platforms.begin(), platforms.end(),
-        [](const Platform &p) { return !p.alive; }), platforms.end());
-
-
     for (auto &ft : floatingTexts) ft.Update(dt);
     for (auto &ft : floatingTexts) ft.Render(renderer);
     floatingTexts.erase(std::remove_if(floatingTexts.begin(), floatingTexts.end(), [](const FloatingText &ft) { return !ft.alive; }), floatingTexts.end());
@@ -613,6 +662,15 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     } else if (gameState == GameState::Playing) {
         // keep auto hovering before start
         player.Update(dt);
+    }
+
+    if (IsPlayingActive() && !waitingForStart && comboCount > 0) {
+        comboTimer -= dt;
+        if (comboTimer <= 0.0f) {
+            comboCount = 0;
+            comboTimer = 0.0f;
+            UpdateComboText();
+        }
     }
 
     // Spawn coins off-screen and move left
@@ -664,13 +722,56 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 float amp = std::uniform_real_distribution<float>(20.0f, 40.0f)(rng);
                 float freq = std::uniform_real_distribution<float>(1.5f, 3.0f)(rng);
                 float phase = std::uniform_real_distribution<float>(0.0f, SDL_PI_F * 2.0f)(rng);
-                platforms.emplace_back(kWinW + 100.0f, platY, platSpeed, amp, freq, phase);
             }
             coinSpawnInterval = intervalDist(rng);
 
-
-
         }
+    }
+
+    // Powerup spawn
+    if (IsPlayingActive() && !waitingForStart) {
+        powerupSpawnTimer += dt;
+        if (powerupSpawnTimer >= powerupSpawnInterval && powerups.size() < 2) {
+            powerupSpawnTimer = 0.0f;
+            powerupSpawnInterval = 8.0f + (rng() % 3000) / 1000.0f; // 8-11 sec
+            PowerupType type = (rng() % 2 == 0) ? PowerupType::Magnet : PowerupType::Shield;
+            if (rng() % 3 == 0) type = PowerupType::Spread; // occasionally spread
+            float y = 50.0f + (rng() % (kWinH - 100));
+            float x = kWinW + 60.0f; // spawn off-screen to the right, drift left
+            float spd = std::uniform_real_distribution<float>(140.0f, 200.0f)(rng);
+            float amp = std::uniform_real_distribution<float>(6.0f, 18.0f)(rng);
+            float freq = std::uniform_real_distribution<float>(1.5f, 3.2f)(rng);
+            float phase = std::uniform_real_distribution<float>(0.0f, SDL_PI_F * 2.0f)(rng);
+            powerups.push_back({type, SDL_FPoint{ x, y }, true, 12.0f, spd, amp, freq, phase, 0.0f});
+        }
+    }
+
+    // Update powerups
+    if (!powerups.empty()) {
+        for (auto &p : powerups) {
+            p.ttl -= dt;
+            p.t += dt;
+            p.pos.x -= p.speed * dt;
+            float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
+            p.pos.y += bob * dt;
+            if (p.pos.x < -60.0f) p.alive = false;
+            if (p.ttl <= 0.0f) p.alive = false;
+        }
+        powerups.erase(std::remove_if(powerups.begin(), powerups.end(), [](const Powerup &p){ return !p.alive; }), powerups.end());
+    }
+
+    // Active powerup timers
+    if (magnetActive) {
+        magnetTimer -= dt;
+        if (magnetTimer <= 0.0f) { magnetActive = false; magnetTimer = 0.0f; }
+    }
+    if (shieldActive) {
+        shieldTimer -= dt;
+        if (shieldTimer <= 0.0f) { shieldActive = false; shieldTimer = 0.0f; }
+    }
+    if (spreadActive) {
+        spreadTimer -= dt;
+        if (spreadTimer <= 0.0f) { spreadActive = false; spreadTimer = 0.0f; }
     }
 
     if (IsPlayingActive() && !waitingForStart) {
@@ -688,7 +789,6 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             std::uniform_real_distribution<float> xdist(-60.0f, kWinW + 60.0f);
             std::uniform_real_distribution<float> ydist(-60.0f, kWinH + 60.0f);
             std::uniform_real_distribution<float> speedDist(220.0f, 300.0f);
-            std::uniform_real_distribution<float> intervalDist(2.2f, 3.8f);
             std::uniform_int_distribution<int> sideDist(0, 3); // 0 right,1 left,2 top,3 bottom
 
             float spawnX = kWinW + 80.0f;
@@ -710,6 +810,11 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
             float spd = speedDist(rng);
             bats.emplace_back(spawnX, spawnY, spd);
+            // ramp difficulty over time (more bats, shorter interval)
+            float diff = ClampF(1.0f + gameTimer * 0.03f, 1.0f, 3.5f);
+            float minInt = std::max(0.6f, 2.2f / diff);
+            float maxInt = std::max(1.0f, 3.8f / diff);
+            std::uniform_real_distribution<float> intervalDist(minInt, maxInt);
             batSpawnInterval = intervalDist(rng);
         }
     }
@@ -816,12 +921,32 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         const float coinSize = 32.0f;
         for (auto &c : coins) {
             if (!c.alive) continue;
+
+            if (magnetActive) {
+                SDL_FPoint pc = player.Center();
+                float dx = pc.x - c.pos.x;
+                float dy = pc.y - c.pos.y;
+                float dist2 = dx*dx + dy*dy;
+                const float radius = 180.0f;
+                if (dist2 < radius * radius) {
+                    float dist = SDL_sqrtf(dist2);
+                    if (dist < 1.0f) dist = 1.0f;
+                    dx /= dist; dy /= dist;
+                    float pull = 420.0f;
+                    c.pos.x += dx * pull * dt;
+                    c.pos.y += dy * pull * dt;
+                }
+            }
+
             SDL_FRect coinBox{ c.pos.x - coinSize * 0.5f, c.pos.y - coinSize * 0.5f, coinSize, coinSize };
             if (AABBOverlap(playerBox, coinBox)) {
+                gSoundManager.PlaySound("coin");
                 c.alive = false;
                 coinCount++;
             }
         }
+
+        SDL_FRect screenRect{0.0f, 0.0f, (float)kWinW, (float)kWinH};
 
         for (auto &p : projectiles) {
             if (!p.alive) continue;
@@ -829,12 +954,18 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             for (auto &b : bats) {
                 if (!b.alive) continue;
                 SDL_FRect batBox = b.Bounds();
+                bool batOnScreen = AABBOverlap(batBox, screenRect);
+                if (!batOnScreen) continue;
                 if (AABBOverlap(projBox, batBox)) {
+                    gSoundManager.PlaySound("bat_hit");
                     b.Kill();
                     p.alive = false;
-                    int points = player.onPlatform ? 2 : 1;
+                    int points = 1;
                     score += points;
-                    floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});  // yellow "+1" or "+2"
+                    comboCount++;
+                    comboTimer = comboTimeout;
+                    UpdateComboText();
+                    floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});  // yellow "+1"
                     break;
                 }
             }
@@ -843,9 +974,23 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         // Bat vs player
         for (auto &b : bats) {
             if (!b.alive || b.state != BatState::Moving) continue;
-            if (AABBOverlap(playerBox, b.Bounds())) {
+            SDL_FRect batBox = b.Bounds();
+            bool batOnScreen = AABBOverlap(batBox, screenRect);
+            if (!batOnScreen) continue;
+            if (AABBOverlap(playerBox, batBox)) {
+                if (shieldActive) {
+                    gSoundManager.PlaySound("bat_hit");
+                    b.Kill();
+                    comboCount++;
+                    comboTimer = comboTimeout;
+                    UpdateComboText();
+                    continue;
+                }
                 player.dead = true;
                 playerDead = true;
+                comboCount = 0;
+                comboTimer = 0.0f;
+                UpdateComboText();
                 gameState = GameState::GameOver;
                 // update records
                 if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
@@ -860,6 +1005,28 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 break;
             }
         }
+
+        // Powerup collection
+        for (auto &p : powerups) {
+            if (!p.alive) continue;
+            float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
+            float sz = 35.0f;
+            SDL_FRect puBox{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f + bob, sz, sz };
+            if (AABBOverlap(playerBox, puBox)) {
+                if (p.type == PowerupType::Magnet) {
+                    magnetActive = true;
+                    magnetTimer = 10.0f;
+                } else if (p.type == PowerupType::Shield) {
+                    shieldActive = true;
+                    shieldTimer = 10.0f;
+                } else if (p.type == PowerupType::Spread) {
+                    spreadActive = true;
+                    spreadTimer = 8.0f;
+                }
+                p.alive = false;
+            }
+        }
+        powerups.erase(std::remove_if(powerups.begin(), powerups.end(), [](const Powerup &p){ return !p.alive; }), powerups.end());
     }
 
 
@@ -880,6 +1047,24 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
         for (auto &c : coins) {
             c.Render(renderer);
+        }
+
+        // Powerups
+        for (auto &p : powerups) {
+            if (!p.alive) continue;
+            SDL_Texture *tex = nullptr;
+            if (p.type == PowerupType::Magnet) tex = magnetTex;
+            else if (p.type == PowerupType::Shield) tex = shieldTex;
+            else if (p.type == PowerupType::Spread) tex = magnetTex;
+            float sz = 35.0f;
+            float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
+            SDL_FRect dst{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f + bob, sz, sz };
+            if (tex) {
+                SDL_RenderTexture(renderer, tex, nullptr, &dst);
+            } else {
+                SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
+                SDL_RenderFillRect(renderer, &dst);
+            }
         }
     }
 
@@ -988,6 +1173,58 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             SDL_FRect dst{ timeX, 32.0f + bob, hudTimeText.w, hudTimeText.h };
             SDL_RenderTexture(renderer, hudTimeText.tex, nullptr, &dst);
         }
+        // Combo HUD: always visible. Wave after 3, rainbow after 5, per-letter wave.
+        {
+            std::string comboStr = "Combo " + std::to_string(comboCount);
+            double t = (double)SDL_GetTicks() / 1000.0;
+            float baseX = (float)kWinW - margin;
+            float baseY = 54.0f + bob;
+            float spacing = 1.0f;
+            float waveAmp = (comboCount >= 3) ? ((comboCount >= 5) ? 5.0f : 3.0f) : 0.0f;
+            float waveFreq = 3.5f;
+
+            // measure to right-align
+            float totalW = 0.0f;
+            std::vector<float> widths;
+            widths.reserve(comboStr.size());
+            for (char ch : comboStr) {
+                char cstr[2] = {ch, '\0'};
+                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 1, SDL_Color{255,255,255,255});
+                float w = s ? (float)s->w : 0.0f;
+                widths.push_back(w);
+                totalW += w + spacing;
+                if (s) SDL_DestroySurface(s);
+            }
+            float startX = baseX - totalW;
+
+            float x = startX;
+            for (size_t i = 0; i < comboStr.size(); ++i) {
+                char cstr[2] = {comboStr[i], '\0'};
+                SDL_Color col{255,255,255,255};
+                if (comboCount >= 5) {
+                    col.r = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.0f + 0.6f * (float)i));
+                    col.g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 0.6f * (float)i + 2.0f));
+                    col.b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 0.6f * (float)i + 4.0f));
+                }
+                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 1, col);
+                if (!s) continue;
+                SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, s);
+                float w = (float)s->w;
+                float h = (float)s->h;
+                float waveY = (waveAmp > 0.0f) ? SDL_sinf((float)t * waveFreq + 0.5f * (float)i) * waveAmp : 0.0f;
+                SDL_FRect shadow{ x + 2.0f, baseY + waveY + 2.0f, w, h };
+                SDL_SetTextureColorMod(tex, 0,0,0);
+                SDL_SetTextureAlphaMod(tex, 160);
+                SDL_RenderTexture(renderer, tex, nullptr, &shadow);
+                SDL_SetTextureColorMod(tex, 255,255,255);
+                SDL_SetTextureAlphaMod(tex, 255);
+                SDL_FRect dst{ x, baseY + waveY, w, h };
+                SDL_RenderTexture(renderer, tex, nullptr, &dst);
+                SDL_DestroyTexture(tex);
+                SDL_DestroySurface(s);
+                x += w + spacing;
+            }
+        }
 
         if (showFlyHint && font) {
             const char *hint = "Press W or SPACE to fly";
@@ -1015,6 +1252,27 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 }
                 SDL_DestroySurface(s);
             }
+        }
+
+        // Powerup icons/timers
+        float puY = 70.0f;
+        float iconSize = 28.0f;
+        if (magnetActive && magnetTex) {
+            SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
+            SDL_RenderTexture(renderer, magnetTex, nullptr, &dst);
+            puY += iconSize + 6.0f;
+        }
+        if (shieldActive && shieldTex) {
+            SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
+            SDL_RenderTexture(renderer, shieldTex, nullptr, &dst);
+            puY += iconSize + 6.0f;
+        }
+        if (spreadActive && magnetTex) {
+            SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
+            SDL_SetTextureColorMod(magnetTex, 64, 200, 255);
+            SDL_RenderTexture(renderer, magnetTex, nullptr, &dst);
+            SDL_SetTextureColorMod(magnetTex, 255, 255, 255);
+            puY += iconSize + 6.0f;
         }
     }
 
@@ -1165,7 +1423,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             Uint8 g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 2.0f));
             Uint8 b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 4.0f));
             SDL_SetTextureColorMod(newRecordText.tex, r, g, b);
-            SDL_FRect dst{ kWinW * 0.5f - newRecordText.w * 0.5f + 20.0f, recY, newRecordText.w, newRecordText.h };
+            SDL_FRect dst{ kWinW * 0.5f - newRecordText.w * 0.5f, recY, newRecordText.w, newRecordText.h };
             SDL_RenderTexture(renderer, newRecordText.tex, nullptr, &dst);
         }
 
@@ -1196,6 +1454,8 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     if (psTextureL3) { SDL_DestroyTexture(psTextureL3); psTextureL3 = NULL; }
     if (psTextureL4) { SDL_DestroyTexture(psTextureL4); psTextureL4 = NULL; }
     if (psTextureL5) { SDL_DestroyTexture(psTextureL5); psTextureL5 = NULL; }
+    if (magnetTex) { SDL_DestroyTexture(magnetTex); magnetTex = nullptr; }
+    if (shieldTex) { SDL_DestroyTexture(shieldTex); shieldTex = nullptr; }
 
     runningAnim.DestroyFrames();
     flyingAnim.DestroyFrames();
@@ -1211,6 +1471,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(overTitleText);
     DestroyCached(overCoinsText);
     DestroyCached(overTimeText);
+    DestroyCached(hudComboText);
     if (arrowTex) { SDL_DestroyTexture(arrowTex); arrowTex = nullptr; }
     if (cursorTex) { SDL_DestroyTexture(cursorTex); cursorTex = nullptr; }
     for (auto &pl : pausedLetters) {

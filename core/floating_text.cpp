@@ -1,5 +1,6 @@
 #include "floating_text.h"
 #include <cmath>
+#include <cstring>
 
 extern SDL_Renderer *renderer;
 extern TTF_Font *font;  // We need the global font from main.cpp
@@ -23,14 +24,10 @@ void FloatingText::Render(SDL_Renderer *r) {
     if (!alive || !font) return;
 
     // Arcade-style blinking
-    Uint8 alpha = (fmodf(blinkTimer, 0.2f) < 0.1f) ? 255 : 0;
+    Uint8 alpha = (fmodf(blinkTimer, 0.2f) < 0.1f) ? 255 : 180;
 
-    // Create a temporary color with current alpha
     SDL_Color renderColor = color;
-    renderColor.a = alpha;
-
-    // TTF_RenderText_Solid in SDL3 takes SDL_Color directly
-    SDL_Surface *surface = TTF_RenderText_Solid(font, text.c_str(), strlen(text.c_str()), renderColor);
+    SDL_Surface *surface = TTF_RenderText_Blended(font, text.c_str(), (int)strlen(text.c_str()), renderColor);
     if (!surface) {
         printf("TTF_RenderText_Solid failed: %s\n", SDL_GetError());
         return;
@@ -48,6 +45,7 @@ void FloatingText::Render(SDL_Renderer *r) {
             h
         };
 
+        SDL_SetTextureAlphaMod(tex, alpha);
         SDL_RenderTexture(r, tex, nullptr, &dst);
         SDL_DestroyTexture(tex);
     }
