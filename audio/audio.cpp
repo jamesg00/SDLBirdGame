@@ -118,10 +118,11 @@ void SoundManager::StopSound(const std::string& name) {
 }
 
 void SoundManager::CleanupCoinStreams() {
+    if (coinStreams.size() < 8) return;
+
     coinStreams.erase(
         std::remove_if(coinStreams.begin(), coinStreams.end(), [](SDL_AudioStream* s){
             if (!s) return true;
-            // If nothing left queued, consider it done
             int avail = SDL_GetAudioStreamAvailable(s);
             if (avail <= 0) {
                 SDL_DestroyAudioStream(s);
@@ -130,13 +131,26 @@ void SoundManager::CleanupCoinStreams() {
             return false;
         }),
         coinStreams.end());
+
+    if (coinStreams.size() > 16) {
+        size_t removeCount = coinStreams.size() - 16;
+        if (removeCount > coinStreams.size()) removeCount = coinStreams.size();
+        for (size_t i = 0; i < removeCount; ++i) {
+            if (coinStreams[i]) SDL_DestroyAudioStream(coinStreams[i]);
+        }
+        coinStreams.erase(coinStreams.begin(), coinStreams.begin() + removeCount);
+    }
 }
 
 void SoundManager::Update() {
-    CleanupCoinStreams();
+    updateCounter++;
+    if (updateCounter % 10 == 0) {
+        CleanupCoinStreams();
+    }
+
     if (musicStream && !musicData.empty()) {
         int avail = SDL_GetAudioStreamAvailable(musicStream);
-        if (avail < static_cast<int>(musicData.size() / 2)) {
+        if (avail < static_cast<int>(musicData.size() / 4)) {
             SDL_PutAudioStreamData(musicStream, musicData.data(), static_cast<int>(musicData.size()));
         }
     }

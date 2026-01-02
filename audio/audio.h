@@ -40,6 +40,7 @@ private:
     SDL_AudioStream *musicStream = nullptr;
     float musicVolume = 1.0f;
     float sfxVolume = 1.0f;
+    int updateCounter = 0;
 };
 
 extern SoundManager gSoundManager;

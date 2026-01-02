@@ -47,6 +47,8 @@ static const int kShieldFrameCount = 97;
 static float shieldAnimTimer = 0.0f;
 static int shieldAnimFrame = 0;
 static const float kShieldFrameTime = 0.04f;
+static bool isFullscreen = false;
+static bool wasF12Down = false;
 static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
@@ -606,8 +608,8 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 /* This function runs once per frame, and is the heart of the program. */
 SDL_AppResult SDL_AppIterate(void *appstate)
 {
-
-
+    uint64_t frameStartTicks = SDL_GetPerformanceCounter();
+    uint64_t perfFreq = SDL_GetPerformanceFrequency();
     SDL_RenderClear(renderer);
     gSoundManager.Update();
 
@@ -631,6 +633,13 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     last = now;
 
     bool escapeDown = input.Down(SDL_SCANCODE_ESCAPE);
+    bool f12Down = input.Down(SDL_SCANCODE_F12);
+    if (f12Down && !wasF12Down) {
+        isFullscreen = !isFullscreen;
+        SDL_SetWindowFullscreen(window, isFullscreen ? true : false);
+        last = SDL_GetPerformanceCounter();
+        dt = 0.0f;
+    }
     if (escapeDown && !wasEscapeDown) {
         if (playerDead && gameState == GameState::GameOver) {
             ResetGameState();
@@ -667,6 +676,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         }
     }
     wasEscapeDown = escapeDown;
+    wasF12Down = f12Down;
 
     if (playerDead || player.dead || gameState == GameState::Paused ||
         (gameState == GameState::Options && optionsFromPaused)) {
@@ -1322,7 +1332,17 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         }
         // Combo HUD: always visible. Wave after 3, rainbow after 5, per-letter wave.
         {
+            static std::string lastComboStr;
+            static std::vector<CachedText> comboLetterCache;
+
             std::string comboStr = "Combo " + std::to_string(comboCount);
+            if (comboStr != lastComboStr) {
+                for (auto &c : comboLetterCache) DestroyCached(c);
+                comboLetterCache.clear();
+                comboLetterCache.resize(comboStr.size());
+                lastComboStr = comboStr;
+            }
+
             double t = (double)SDL_GetTicks() / 1000.0;
             float baseX = (float)kWinW - margin;
             float baseY = 54.0f + bob;
@@ -1332,19 +1352,6 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
             // measure to right-align
             float totalW = 0.0f;
-            std::vector<float> widths;
-            widths.reserve(comboStr.size());
-            for (char ch : comboStr) {
-                char cstr[2] = {ch, '\0'};
-                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 0, SDL_Color{255,255,255,255});
-                float w = s ? (float)s->w : 0.0f;
-                widths.push_back(w);
-                totalW += w + spacing;
-                if (s) SDL_DestroySurface(s);
-            }
-            float startX = baseX - totalW;
-
-            float x = startX;
             for (size_t i = 0; i < comboStr.size(); ++i) {
                 char cstr[2] = {comboStr[i], '\0'};
                 SDL_Color col{255,255,255,255};
@@ -1353,23 +1360,25 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     col.g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 0.6f * (float)i + 2.0f));
                     col.b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 0.6f * (float)i + 4.0f));
                 }
-                SDL_Surface *s = TTF_RenderText_Blended(font, cstr, 0, col);
-                if (!s) continue;
-                SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, s);
-                float w = (float)s->w;
-                float h = (float)s->h;
+                UpdateCachedText(comboLetterCache[i], cstr, col);
+                totalW += comboLetterCache[i].w + spacing;
+            }
+            float startX = baseX - totalW;
+
+            float x = startX;
+            for (size_t i = 0; i < comboStr.size(); ++i) {
+                auto &ct = comboLetterCache[i];
+                if (!ct.tex) continue;
                 float waveY = (waveAmp > 0.0f) ? SDL_sinf((float)t * waveFreq + 0.5f * (float)i) * waveAmp : 0.0f;
-                SDL_FRect shadow{ x + 2.0f, baseY + waveY + 2.0f, w, h };
-                SDL_SetTextureColorMod(tex, 0,0,0);
-                SDL_SetTextureAlphaMod(tex, 160);
-                SDL_RenderTexture(renderer, tex, nullptr, &shadow);
-                SDL_SetTextureColorMod(tex, 255,255,255);
-                SDL_SetTextureAlphaMod(tex, 255);
-                SDL_FRect dst{ x, baseY + waveY, w, h };
-                SDL_RenderTexture(renderer, tex, nullptr, &dst);
-                SDL_DestroyTexture(tex);
-                SDL_DestroySurface(s);
-                x += w + spacing;
+                SDL_FRect shadow{ x + 2.0f, baseY + waveY + 2.0f, ct.w, ct.h };
+                SDL_SetTextureColorMod(ct.tex, 0,0,0);
+                SDL_SetTextureAlphaMod(ct.tex, 160);
+                SDL_RenderTexture(renderer, ct.tex, nullptr, &shadow);
+                SDL_SetTextureColorMod(ct.tex, 255,255,255);
+                SDL_SetTextureAlphaMod(ct.tex, 255);
+                SDL_FRect dst{ x, baseY + waveY, ct.w, ct.h };
+                SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
+                x += ct.w + spacing;
             }
         }
 
@@ -1674,6 +1683,13 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     /* put the newly-cleared rendering on the screen. */
     SDL_RenderPresent(renderer);
+
+    uint64_t frameEndTicks = SDL_GetPerformanceCounter();
+    float frameMs = (float)(frameEndTicks - frameStartTicks) * 1000.0f / (float)perfFreq;
+    if (frameMs > 20.0f) {
+        SDL_Log("SLOW FRAME: %.2f ms | proj=%zu bats=%zu coins=%zu",
+                frameMs, projectiles.size(), bats.size(), coins.size());
+    }
 
     return SDL_APP_CONTINUE;  /* carry on with the program! */
 }

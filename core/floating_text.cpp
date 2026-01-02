@@ -59,9 +59,9 @@ void FloatingText::Render(SDL_Renderer *r) {
         }
         SDL_SetTextureAlphaMod(tex, alpha);
         SDL_RenderTexture(r, tex, nullptr, &dst);
+        SDL_DestroyTexture(tex);
     }
 
-    if (tex) SDL_DestroyTexture(tex);
     if (shadowTex) SDL_DestroyTexture(shadowTex);
     SDL_DestroySurface(surface);  // SDL3: NOT SDL_FreeSurface
     if (shadowSurface) SDL_DestroySurface(shadowSurface);
