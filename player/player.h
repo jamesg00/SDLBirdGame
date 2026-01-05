@@ -16,6 +16,8 @@ extern bool playerDead;
 extern TTF_Font *font;
 extern bool spreadActive;
 
+
+
 enum class AnimState {
     Running,
     Flying
@@ -32,6 +34,7 @@ struct Player {
     SDL_FPoint Center() const;
 
     bool dead = false;
+
 
 private:
     SDL_FRect rect{300.0f, 50.0f, 40.0f, 40.0f};

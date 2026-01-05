@@ -159,7 +159,7 @@ void SoundManager::Update() {
 // Specialized handling for coin: allow overlapping by spinning up a temporary stream per play.
 // The default PlaySound will be used for others.
 void SoundManager::PlaySound(const std::string& name) {
-    if (name == "coin") {
+    if (name == "coin" || name == "shoot") {
         auto it = sounds.find(name);
         if (it == sounds.end() || it->second.empty()) return;
         if (deviceId == 0) return;
@@ -188,7 +188,7 @@ void SoundManager::PlaySound(const std::string& name) {
     SDL_AudioStream *s = itStream->second;
     if (!s) return;
 
-    if (name == "jump") {
+    if (name == "jump" || name == "bat_hit") {
         SDL_DestroyAudioStream(s);
         soundStreams[name] = CreateBoundStream();
         s = soundStreams[name];

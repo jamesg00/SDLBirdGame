@@ -82,27 +82,17 @@ void Player::Update(float dt) {
     // Gravity and integration
     velocity.y += kGravity * dt;
     if (!autopilot && downDown) {
-        velocity.y += kDiveAccel * dt; // intentional dive for quick drops
+        velocity.y += kDiveAccel * dt; // dive for quick drop
     }
     rect.x += velocity.x * dt;
     rect.y += velocity.y * dt;
 
-    // Bounds
+    // Bounds (kill on edges)
     const float floor = kFloorY - rect.h;
-    if (rect.y > floor) {
-        rect.y = floor;
-        velocity.y = 0.0f;
-    }
-    if (rect.x < 0.0f) {
-        rect.x = 0.0f;
-        velocity.x = 0.0f;
-    } else if (rect.x + rect.w > 480.0f) {
-        rect.x = 480.0f - rect.w;
-        velocity.x = 0.0f;
-    }
-    if (rect.y < 0.0f) {
-        rect.y = 0.0f;
-        velocity.y = 0.0f;
+    if (rect.y > floor || rect.y < 0.0f || rect.x < 0.0f || rect.x + rect.w > 480.0f) {
+        gSoundManager.PlaySound("bat_hit");
+        dead = true;
+        return;
     }
 
     // Animation update
@@ -133,6 +123,7 @@ void Player::Update(float dt) {
 
     if (!autopilot) {
         if (mouseDown && !wasMouseDown) {
+            gSoundManager.PlaySound("shoot");
             float pcx = rect.x + rect.w * 0.5f;
             float pcy = rect.y + rect.h * 0.5f;
 
@@ -148,20 +139,13 @@ void Player::Update(float dt) {
             float angle = SDL_atan2(dy, dx) * (180.0f / SDL_PI_D);
 
             projectiles.emplace_back(pcx, pcy, vx, vy, angle);
-            if (spreadActive) {
-                const float spreadDeg = 14.0f;
-                float radLeft = (angle - spreadDeg) * SDL_PI_F / 180.0f;
-                float radRight = (angle + spreadDeg) * SDL_PI_F / 180.0f;
-                float vxL = SDL_cosf(radLeft) * speed;
-                float vyL = SDL_sinf(radLeft) * speed;
-                float vxR = SDL_cosf(radRight) * speed;
-                float vyR = SDL_sinf(radRight) * speed;
-                projectiles.emplace_back(pcx, pcy, vxL, vyL, angle - spreadDeg);
-                projectiles.emplace_back(pcx, pcy, vxR, vyR, angle + spreadDeg);
-            }
         }
     }
     wasMouseDown = mouseDown;
+
+    bool onPlatform = false;
+
+
 }
 
 void Player::Render(SDL_Renderer *r) const {

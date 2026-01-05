@@ -42,13 +42,11 @@ SDL_Texture *coinFrames[4] = {nullptr};
 SDL_Texture *batMoveFrames[16] = {nullptr};
 SDL_Texture *batDeathFrames[8] = {nullptr};
 static SDL_Texture *warningFrames[9] = {nullptr};
-static SDL_Texture *shieldFrames[97] = {nullptr};
-static const int kShieldFrameCount = 97;
+static SDL_Texture *shieldFrames[32] = {nullptr};
+static const int kShieldFrameCount = 32;
 static float shieldAnimTimer = 0.0f;
 static int shieldAnimFrame = 0;
 static const float kShieldFrameTime = 0.04f;
-static bool isFullscreen = false;
-static bool wasF12Down = false;
 static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
@@ -62,6 +60,10 @@ static bool shieldActive = false;
 static float shieldTimer = 0.0f;
 bool spreadActive = false;
 static float spreadTimer = 0.0f;
+static bool isFullscreen = false;
+static bool wasF12Down = false;
+bool perfectShot = false;
+
 
 struct PausedLetter {
     SDL_Texture *tex = nullptr;
@@ -100,6 +102,9 @@ static CachedText overTitleText;
 static CachedText overCoinsText;
 static CachedText overTimeText;
 static CachedText newRecordText;
+static CachedText perfectShotText;
+
+static int frameCounter = 0;
 
 static void DestroyCached(CachedText &ct) {
     if (ct.tex) { SDL_DestroyTexture(ct.tex); ct.tex = nullptr; }
@@ -130,23 +135,53 @@ static void UpdateComboText() {
     UpdateCachedText(hudComboText, "Combo: " + std::to_string(comboCount), col);
 }
 
+
+static void UpdatePerfectScoreText() {
+    SDL_Color col{255, 215, 0, 255}; // gold color
+    UpdateCachedText(perfectShotText, "Perfect Shot!", col);
+}
+
 // Render a per-letter wave title with a subtle drop shadow.
+struct CachedWaveLetter {
+    SDL_Texture *tex = nullptr;
+    float w = 0.0f;
+    float h = 0.0f;
+};
+static std::vector<CachedWaveLetter> waveTitleCache;
+static std::string cachedWaveTitle;
+
+static void ClearWaveCache() {
+    for (auto &c : waveTitleCache) {
+        if (c.tex) SDL_DestroyTexture(c.tex);
+    }
+    waveTitleCache.clear();
+    cachedWaveTitle.clear();
+}
+
 static void RenderWaveTitle(const std::string &text, float centerX, float baseY) {
     if (!font || text.empty()) return;
 
-    const float spacing = 2.0f;
-    int totalW = 0;
-    int maxH = 0;
-    for (char ch : text) {
-        char buf[2] = {ch, '\0'};
-        int lw = 0, lh = 0;
-        if (TTF_GetStringSize(font, buf, SDL_strlen(buf), &lw, &lh)) {
-            totalW += lw;
-            totalW += (int)spacing;
-            if (lh > maxH) maxH = lh;
+    if (text != cachedWaveTitle) {
+        ClearWaveCache();
+        cachedWaveTitle = text;
+        SDL_Color white{255, 255, 255, 255};
+        for (char ch : text) {
+            char buf[2] = {ch, '\0'};
+            SDL_Surface *surf = TTF_RenderText_Blended(font, buf, 0, white);
+            if (!surf) continue;
+            CachedWaveLetter letter;
+            letter.tex = SDL_CreateTextureFromSurface(renderer, surf);
+            letter.w = (float)surf->w;
+            letter.h = (float)surf->h;
+            SDL_DestroySurface(surf);
+            waveTitleCache.push_back(letter);
         }
     }
-    if (totalW > 0) totalW -= (int)spacing; // remove trailing spacing
+
+    const float spacing = 2.0f;
+    float totalW = 0.0f;
+    for (const auto &c : waveTitleCache) totalW += c.w + spacing;
+    if (!waveTitleCache.empty()) totalW -= spacing;
 
     double t = (double)SDL_GetTicks() / 1000.0;
     const float waveAmp = 6.0f;
@@ -154,42 +189,24 @@ static void RenderWaveTitle(const std::string &text, float centerX, float baseY)
     const float phaseStep = 0.5f;
     const float shadowOffset = 3.0f;
 
-    float x = centerX - (float)totalW * 0.5f;
-    for (size_t i = 0; i < text.size(); ++i) {
-        char buf[2] = {text[i], '\0'};
-        SDL_Color white{255, 255, 255, 255};
-        SDL_Color shadow{0, 0, 0, 180};
-
-        SDL_Surface *surfShadow = TTF_RenderText_Blended(font, buf, 0, shadow);
-        SDL_Surface *surfMain = TTF_RenderText_Blended(font, buf, 0, white);
-        if (!surfMain) {
-            if (surfShadow) SDL_DestroySurface(surfShadow);
-            continue;
-        }
-
+    float x = centerX - totalW * 0.5f;
+    for (size_t i = 0; i < waveTitleCache.size(); ++i) {
+        const auto &letter = waveTitleCache[i];
+        if (!letter.tex) continue;
         float waveY = SDL_sinf((float)t * waveFreq + phaseStep * (float)i) * waveAmp;
         float y = baseY + waveY;
 
-        SDL_Texture *texShadow = surfShadow ? SDL_CreateTextureFromSurface(renderer, surfShadow) : nullptr;
-        SDL_Texture *texMain = SDL_CreateTextureFromSurface(renderer, surfMain);
-        float w = (float)surfMain->w;
-        float h = (float)surfMain->h;
+        SDL_SetTextureColorMod(letter.tex, 0, 0, 0);
+        SDL_SetTextureAlphaMod(letter.tex, 180);
+        SDL_FRect shadow{ x + shadowOffset, y + shadowOffset, letter.w, letter.h };
+        SDL_RenderTexture(renderer, letter.tex, nullptr, &shadow);
 
-        if (texShadow) {
-            SDL_FRect dst{ x + shadowOffset, y + shadowOffset, w, h };
-            SDL_RenderTexture(renderer, texShadow, nullptr, &dst);
-        }
-        if (texMain) {
-            SDL_FRect dst{ x, y, w, h };
-            SDL_RenderTexture(renderer, texMain, nullptr, &dst);
-        }
+        SDL_SetTextureColorMod(letter.tex, 255, 255, 255);
+        SDL_SetTextureAlphaMod(letter.tex, 255);
+        SDL_FRect dst{ x, y, letter.w, letter.h };
+        SDL_RenderTexture(renderer, letter.tex, nullptr, &dst);
 
-        if (texShadow) SDL_DestroyTexture(texShadow);
-        if (texMain) SDL_DestroyTexture(texMain);
-        SDL_DestroySurface(surfMain);
-        if (surfShadow) SDL_DestroySurface(surfShadow);
-
-        x += w + spacing;
+        x += letter.w + spacing;
     }
 }
 
@@ -501,6 +518,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     UpdateCachedText(menuOptionsText, "OPTIONS", white);
     UpdateCachedText(overTitleText, "GAME OVER!", white);
     UpdateCachedText(newRecordText, "NEW RECORD!", white);
+    
     optionsStateText.text.clear(); // will be set on render
     hudLastCoins = -1;
     hudLastTime = -1;
@@ -572,7 +590,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     shieldTex = IMG_LoadTexture(renderer, "assets/shield.png");
     for (int i = 0; i < kShieldFrameCount; ++i) {
         char file[64];
-        SDL_snprintf(file, sizeof(file), "assets/frames/frame%04d.png", i + 1);
+        SDL_snprintf(file, sizeof(file), "assets/frames/frame%04d.png", i * 3 + 1);
         shieldFrames[i] = IMG_LoadTexture(renderer, file);
     }
 
@@ -608,10 +626,12 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 /* This function runs once per frame, and is the heart of the program. */
 SDL_AppResult SDL_AppIterate(void *appstate)
 {
-    uint64_t frameStartTicks = SDL_GetPerformanceCounter();
-    uint64_t perfFreq = SDL_GetPerformanceFrequency();
+
+    frameCounter++;
     SDL_RenderClear(renderer);
-    gSoundManager.Update();
+    if (frameCounter % 4 == 0) {
+        gSoundManager.Update();
+    }
 
     //key
     input.Update();
@@ -635,8 +655,12 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     bool escapeDown = input.Down(SDL_SCANCODE_ESCAPE);
     bool f12Down = input.Down(SDL_SCANCODE_F12);
     if (f12Down && !wasF12Down) {
-        isFullscreen = !isFullscreen;
-        SDL_SetWindowFullscreen(window, isFullscreen ? true : false);
+        bool target = !isFullscreen;
+        if (SDL_SetWindowFullscreen(window, target) == 0) {
+            isFullscreen = target;
+        } else {
+            SDL_Log("Fullscreen toggle failed: %s", SDL_GetError());
+        }
         last = SDL_GetPerformanceCounter();
         dt = 0.0f;
     }
@@ -726,6 +750,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         demoProjectiles.erase(std::remove_if(demoProjectiles.begin(), demoProjectiles.end(),
                             [](const DemoProjectile &p){ return !p.alive; }),
                             demoProjectiles.end());
+        if (demoProjectiles.size() > 10) {
+            demoProjectiles.erase(demoProjectiles.begin(), demoProjectiles.begin() + (demoProjectiles.size() - 10));
+        }
     }
 
     farClouds.Update(dt);
@@ -761,6 +788,24 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     } else if (gameState == GameState::Playing) {
         // keep auto hovering before start
         player.Update(dt);
+    }
+
+    // Handle edge death transitioning to game over
+    if (gameState == GameState::Playing && player.dead && !playerDead) {
+        playerDead = true;
+        comboCount = 0;
+        comboTimer = 0.0f;
+        UpdateComboText();
+        gameState = GameState::GameOver;
+        if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
+            bestCoins = coinCount;
+            bestTime = gameTimer;
+            newRecord = true;
+        } else {
+            newRecord = false;
+        }
+        SDL_SetWindowMouseGrab(window, false);
+        SDL_ShowCursor();
     }
 
     if (IsPlayingActive() && !waitingForStart && comboCount > 0) {
@@ -924,7 +969,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             float minInt = std::max(0.6f, 2.2f / diff);
             float maxInt = std::max(1.0f, 3.8f / diff);
             std::uniform_real_distribution<float> intervalDist(minInt, maxInt);
-            batSpawnInterval = intervalDist(rng);
+            batSpawnInterval = std::max(1.0f, intervalDist(rng));
         }
     }
 
@@ -1064,6 +1109,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 [](const Projectile &p) { return !p.alive; }),
             projectiles.end()
         );
+        if (projectiles.size() > 50) {
+            projectiles.erase(projectiles.begin(), projectiles.begin() + (projectiles.size() - 50));
+        }
 
         // Coin collection check
         SDL_FRect playerBox = player.Bounds();
@@ -1109,12 +1157,32 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     gSoundManager.PlaySound("bat_hit");
                     b.Kill();
                     p.alive = false;
+
+                    // Perfect shot: projectile center near bat center
+                    float projCx = projBox.x + projBox.w * 0.5f;
+                    float projCy = projBox.y + projBox.h * 0.5f;
+                    float batCx = batBox.x + batBox.w * 0.5f;
+                    float batCy = batBox.y + batBox.h * 0.5f;
+                    float dx = projCx - batCx;
+                    float dy = projCy - batCy;
+                    float tolX = batBox.w * 0.15f;
+                    float tolY = batBox.h * 0.15f;
+                    bool isPerfect = (SDL_fabsf(dx) <= tolX && SDL_fabsf(dy) <= tolY);
+
                     int points = 1;
+                    if (isPerfect) points += 1;
                     score += points;
                     comboCount++;
                     comboTimer = comboTimeout;
                     UpdateComboText();
                     floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});  // yellow "+1"
+                    if (isPerfect) {
+                        perfectShot = true;
+                        UpdatePerfectScoreText();
+                        floatingTexts.emplace_back(b.pos.x, b.pos.y - 60.0f, "Perfect!", SDL_Color{255, 215, 0, 255});
+                    } else {
+                        perfectShot = false;
+                    }
                     break;
                 }
             }
@@ -1135,6 +1203,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     UpdateComboText();
                     continue;
                 }
+                gSoundManager.PlaySound("bat_hit");
                 player.dead = true;
                 playerDead = true;
                 comboCount = 0;
@@ -1306,10 +1375,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
             // animated coin icon
             static int coinFrame = 0;
-            static float coinTimer = 0.0f;
-            coinTimer += dt;
-            if (coinTimer >= 0.1f) {
-                coinTimer = 0.0f;
+            if (frameCounter % 6 == 0) {
                 coinFrame = (coinFrame + 1) % 4;
             }
             SDL_Texture *cTex = coinFrames[coinFrame];
@@ -1384,6 +1450,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
         if (showFlyHint && font) {
             const char *hint = "Press W or SPACE to fly";
+            const char *edgeWarn = "Stay away from the screen edges!";
             const float baseY = kWinH * 0.7f;
             const float amp = 8.0f;
             const float freq = 2.2f;
@@ -1407,6 +1474,26 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     SDL_DestroyTexture(tex);
                 }
                 SDL_DestroySurface(s);
+            }
+            // Edge warning just below the fly hint
+            SDL_Surface *wSurf = TTF_RenderText_Blended(font, edgeWarn, 0, SDL_Color{255, 120, 120, 255});
+            if (wSurf) {
+                SDL_Texture *wTex = SDL_CreateTextureFromSurface(renderer, wSurf);
+                if (wTex) {
+                    float waveY = SDL_sinf((float)(tNow * 2.5f)) * 6.0f;
+                    float x = kWinW * 0.5f - wSurf->w * 0.5f;
+                    float y = baseY + 30.0f + waveY;
+                    SDL_FRect shadow{ x + 3.0f, y + 3.0f, (float)wSurf->w, (float)wSurf->h };
+                    SDL_SetTextureColorMod(wTex, 0,0,0);
+                    SDL_SetTextureAlphaMod(wTex, 180);
+                    SDL_RenderTexture(renderer, wTex, nullptr, &shadow);
+                    SDL_SetTextureColorMod(wTex, 255,255,255);
+                    SDL_SetTextureAlphaMod(wTex, 255);
+                    SDL_FRect dst{ x, y, (float)wSurf->w, (float)wSurf->h };
+                    SDL_RenderTexture(renderer, wTex, nullptr, &dst);
+                    SDL_DestroyTexture(wTex);
+                }
+                SDL_DestroySurface(wSurf);
             }
         }
 
@@ -1684,13 +1771,6 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     /* put the newly-cleared rendering on the screen. */
     SDL_RenderPresent(renderer);
 
-    uint64_t frameEndTicks = SDL_GetPerformanceCounter();
-    float frameMs = (float)(frameEndTicks - frameStartTicks) * 1000.0f / (float)perfFreq;
-    if (frameMs > 20.0f) {
-        SDL_Log("SLOW FRAME: %.2f ms | proj=%zu bats=%zu coins=%zu",
-                frameMs, projectiles.size(), bats.size(), coins.size());
-    }
-
     return SDL_APP_CONTINUE;  /* carry on with the program! */
 }
 
@@ -1737,6 +1817,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     for (auto &pl : pausedLetters) {
         if (pl.tex) { SDL_DestroyTexture(pl.tex); pl.tex = nullptr; }
     }
+    ClearWaveCache();
     for (int i = 0; i < 4; ++i) {
         if (coinFrames[i]) { SDL_DestroyTexture(coinFrames[i]); coinFrames[i] = nullptr; }
     }
