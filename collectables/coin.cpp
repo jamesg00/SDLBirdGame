@@ -2,6 +2,8 @@
 #include <cmath>     // for sinf
 #include <cstdlib>   // for rand()
 
+extern float gCoinSpinMultiplier;
+
 Coin::Coin(float x, float y, float spd, float a, float f, float ph) 
     : pos{x, y}, speed(spd), amp(a), freq(f), phase(ph) {
     // Randomize starting frame for variety
@@ -16,7 +18,8 @@ void Coin::Update(float dt) {
 
     // Spin animation
     animTimer += dt;
-    const float frameTime = 0.1f;
+    float spin = (gCoinSpinMultiplier > 0.1f) ? gCoinSpinMultiplier : 0.1f;
+    const float frameTime = 0.1f / spin;
     while (animTimer >= frameTime) {
         animTimer -= frameTime;
         frame = (frame + 1) % 4;

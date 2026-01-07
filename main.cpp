@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <random>
 #include <string>
+#include <cmath>
 #include "core/parallax.h"
 #include "core/utils.h"
 #include "core/projectile.h"
@@ -81,6 +82,12 @@ static const SDL_FColor koutline = {0.0f, 0.0f, 0.0f, 1.0f};
 SDL_Texture *projectileFrames[30] = {nullptr}; // 1_0.png to 1_29.png
 static bool wasMouseDown = false;
 
+float gCoinSpinMultiplier = 1.0f;
+static float coinSpinBoostTimer = 0.0f;
+static const float kCoinSpinBoostDuration = 2.0f;
+static float hudCoinAnimTimer = 0.0f;
+static int hudCoinFrame = 0;
+
 
 
 struct CachedText {
@@ -103,8 +110,65 @@ static CachedText overCoinsText;
 static CachedText overTimeText;
 static CachedText newRecordText;
 static CachedText perfectShotText;
+static CachedText nicePopupText;
 
 static int frameCounter = 0;
+
+struct ComboPopup {
+    SDL_FPoint pos;
+    float timer = 0.0f;
+    float lifetime = 2.0f;
+};
+static std::vector<ComboPopup> comboPopups;
+
+static SDL_Color HSVToRGB(float hDeg, float s, float v) {
+    float h = fmodf(hDeg, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = v * s;
+    float x = c * (1.0f - SDL_fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (h < 60.0f) { r = c; g = x; b = 0.0f; }
+    else if (h < 120.0f) { r = x; g = c; b = 0.0f; }
+    else if (h < 180.0f) { r = 0.0f; g = c; b = x; }
+    else if (h < 240.0f) { r = 0.0f; g = x; b = c; }
+    else if (h < 300.0f) { r = x; g = 0.0f; b = c; }
+    else { r = c; g = 0.0f; b = x; }
+    SDL_Color col;
+    col.r = (Uint8)SDL_roundf((r + m) * 255.0f);
+    col.g = (Uint8)SDL_roundf((g + m) * 255.0f);
+    col.b = (Uint8)SDL_roundf((b + m) * 255.0f);
+    col.a = 255;
+    return col;
+}
+
+static SDL_Color RainbowColor(float t, float phase) {
+    float hue = fmodf(t * 120.0f + phase, 360.0f);
+    return HSVToRGB(hue, 1.0f, 1.0f);
+}
+
+static bool GetComboHudRect(SDL_FRect &outRect) {
+    if (!font) return false;
+    std::string comboStr = "Combo " + std::to_string(comboCount);
+    int w = 0, h = 0;
+    if (!TTF_GetStringSize(font, comboStr.c_str(), comboStr.size(), &w, &h)) return false;
+    const float margin = 16.0f;
+    const float baseY = 54.0f;
+    outRect = SDL_FRect{ (float)kWinW - margin - (float)w, baseY, (float)w, (float)h };
+    return true;
+}
+
+static void TriggerComboPopup() {
+    if (comboCount < 10) return;
+    if (!nicePopupText.tex) return;
+    SDL_FRect comboRect;
+    if (!GetComboHudRect(comboRect)) return;
+    const float scale = 0.7f;
+    ComboPopup popup;
+    popup.pos.x = comboRect.x + comboRect.w - nicePopupText.w * scale;
+    popup.pos.y = comboRect.y - nicePopupText.h * scale - 6.0f;
+    comboPopups.push_back(popup);
+}
 
 static void DestroyCached(CachedText &ct) {
     if (ct.tex) { SDL_DestroyTexture(ct.tex); ct.tex = nullptr; }
@@ -335,8 +399,8 @@ inline bool IsPlayingActive() { return gameState == GameState::Playing && !playe
 
 static int hudLastCoins = -1;
 static int hudLastTime = -1;
-static float musicVolumeSetting = 0.35f; // 0..1
-static float sfxVolumeSetting = 1.0f;    // 0..1
+static float musicVolumeSetting = 0.1f; // 0..1
+static float sfxVolumeSetting = 0.1f;    // 0..1
 static bool draggingMusicSlider = false;
 static bool draggingSfxSlider = false;
 static bool optionsFromPaused = false;
@@ -396,6 +460,11 @@ static void ResetGameState() {
     comboCount = 0;
     comboTimer = 0.0f;
     DestroyCached(hudComboText);
+    comboPopups.clear();
+    coinSpinBoostTimer = 0.0f;
+    gCoinSpinMultiplier = 1.0f;
+    hudCoinAnimTimer = 0.0f;
+    hudCoinFrame = 0;
     magnetActive = false;
     shieldActive = false;
     spreadActive = false;
@@ -518,6 +587,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     UpdateCachedText(menuOptionsText, "OPTIONS", white);
     UpdateCachedText(overTitleText, "GAME OVER!", white);
     UpdateCachedText(newRecordText, "NEW RECORD!", white);
+    UpdateCachedText(nicePopupText, "NICE!", white);
     
     optionsStateText.text.clear(); // will be set on render
     hudLastCoins = -1;
@@ -773,12 +843,16 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     for (auto &ft : floatingTexts) ft.Update(dt);
     for (auto &ft : floatingTexts) ft.Render(renderer);
     floatingTexts.erase(std::remove_if(floatingTexts.begin(), floatingTexts.end(), [](const FloatingText &ft) { return !ft.alive; }), floatingTexts.end());
+    for (auto &cp : comboPopups) cp.timer += dt;
+    comboPopups.erase(std::remove_if(comboPopups.begin(), comboPopups.end(),
+        [](const ComboPopup &cp){ return cp.timer >= cp.lifetime; }), comboPopups.end());
 
     if (IsPlayingActive()) {
         if (waitingForStart && flyKeyDown) {
             waitingForStart = false;
             showFlyHint = false;
             player.SetAutopilot(false);
+            coinSpinBoostTimer = kCoinSpinBoostDuration;
         }
         if (showFlyHint && flyKeyDown) {
             showFlyHint = false;
@@ -814,6 +888,22 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             comboCount = 0;
             comboTimer = 0.0f;
             UpdateComboText();
+        }
+    }
+
+    if (IsPlayingActive() && !waitingForStart) {
+        if (coinSpinBoostTimer > 0.0f) {
+            coinSpinBoostTimer -= dt;
+            if (coinSpinBoostTimer < 0.0f) coinSpinBoostTimer = 0.0f;
+            gCoinSpinMultiplier = 1.0f + 2.0f * (coinSpinBoostTimer / kCoinSpinBoostDuration);
+        } else {
+            gCoinSpinMultiplier = 1.0f;
+        }
+        hudCoinAnimTimer += dt * gCoinSpinMultiplier;
+        const float frameTime = 0.1f;
+        while (hudCoinAnimTimer >= frameTime) {
+            hudCoinAnimTimer -= frameTime;
+            hudCoinFrame = (hudCoinFrame + 1) % 4;
         }
     }
 
@@ -1169,13 +1259,14 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     float tolY = batBox.h * 0.15f;
                     bool isPerfect = (SDL_fabsf(dx) <= tolX && SDL_fabsf(dy) <= tolY);
 
-                    int points = 1;
+                    int points = (comboCount + 1 >= 10) ? 3 : 1;
                     if (isPerfect) points += 1;
                     score += points;
                     comboCount++;
                     comboTimer = comboTimeout;
                     UpdateComboText();
-                    floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});  // yellow "+1"
+                    floatingTexts.emplace_back(b.pos.x, b.pos.y - 40.0f, "+" + std::to_string(points), SDL_Color{255, 255, 0, 255});
+                    TriggerComboPopup();
                     if (isPerfect) {
                         perfectShot = true;
                         UpdatePerfectScoreText();
@@ -1201,6 +1292,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     comboCount++;
                     comboTimer = comboTimeout;
                     UpdateComboText();
+                    TriggerComboPopup();
                     continue;
                 }
                 gSoundManager.PlaySound("bat_hit");
@@ -1228,7 +1320,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         for (auto &p : powerups) {
             if (!p.alive) continue;
             float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
-            float sz = 35.0f;
+            float sz = 26.0f;
             SDL_FRect puBox{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f + bob, sz, sz };
             if (AABBOverlap(playerBox, puBox)) {
                 if (p.type == PowerupType::Magnet) {
@@ -1282,7 +1374,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             if (p.type == PowerupType::Magnet) tex = magnetTex;
             else if (p.type == PowerupType::Shield) tex = shieldTex;
             else if (p.type == PowerupType::Spread) tex = magnetTex;
-            float sz = 35.0f;
+            float sz = 26.0f;
             float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
             SDL_FRect dst{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f + bob, sz, sz };
             if (tex) {
@@ -1374,11 +1466,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             SDL_RenderTexture(renderer, hudCoinText.tex, nullptr, &dst);
 
             // animated coin icon
-            static int coinFrame = 0;
-            if (frameCounter % 6 == 0) {
-                coinFrame = (coinFrame + 1) % 4;
-            }
-            SDL_Texture *cTex = coinFrames[coinFrame];
+            SDL_Texture *cTex = coinFrames[hudCoinFrame];
             if (cTex) {
                 float sz = 28.0f;
                 SDL_FRect cdst{ coinX - sz - 4.0f, 10.0f + bob, sz, sz };
@@ -1422,9 +1510,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 char cstr[2] = {comboStr[i], '\0'};
                 SDL_Color col{255,255,255,255};
                 if (comboCount >= 5) {
-                    col.r = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.0f + 0.6f * (float)i));
-                    col.g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 0.6f * (float)i + 2.0f));
-                    col.b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 0.6f * (float)i + 4.0f));
+                    col = RainbowColor((float)t, 20.0f * (float)i);
                 }
                 UpdateCachedText(comboLetterCache[i], cstr, col);
                 totalW += comboLetterCache[i].w + spacing;
@@ -1446,6 +1532,33 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
                 x += ct.w + spacing;
             }
+        }
+
+        if (nicePopupText.tex && !comboPopups.empty()) {
+            double tNow = (double)SDL_GetTicks() / 1000.0;
+            for (const auto &cp : comboPopups) {
+                const float scale = 0.7f;
+                float tNorm = cp.timer / cp.lifetime;
+                float rise = 18.0f;
+                float y = cp.pos.y - rise * tNorm;
+                Uint8 alpha = 255;
+                if (tNorm > 0.7f) {
+                    float fade = (1.0f - (tNorm - 0.7f) / 0.3f);
+                    if (fade < 0.0f) fade = 0.0f;
+                    alpha = (Uint8)SDL_roundf(255.0f * fade);
+                }
+                SDL_Color col = RainbowColor((float)tNow, cp.timer * 60.0f);
+                SDL_SetTextureColorMod(nicePopupText.tex, 0, 0, 0);
+                SDL_SetTextureAlphaMod(nicePopupText.tex, (Uint8)SDL_roundf(alpha * 0.6f));
+                SDL_FRect shadow{ cp.pos.x + 2.0f, y + 2.0f, nicePopupText.w * scale, nicePopupText.h * scale };
+                SDL_RenderTexture(renderer, nicePopupText.tex, nullptr, &shadow);
+                SDL_SetTextureColorMod(nicePopupText.tex, col.r, col.g, col.b);
+                SDL_SetTextureAlphaMod(nicePopupText.tex, alpha);
+                SDL_FRect dst{ cp.pos.x, y, nicePopupText.w * scale, nicePopupText.h * scale };
+                SDL_RenderTexture(renderer, nicePopupText.tex, nullptr, &dst);
+            }
+            SDL_SetTextureColorMod(nicePopupText.tex, 255, 255, 255);
+            SDL_SetTextureAlphaMod(nicePopupText.tex, 255);
         }
 
         if (showFlyHint && font) {
@@ -1499,7 +1612,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
         // Powerup icons/timers
         float puY = 70.0f;
-        float iconSize = 28.0f;
+        float iconSize = 22.0f;
         if (magnetActive && magnetTex) {
             SDL_FRect dst{ 14.0f, puY, iconSize, iconSize };
             SDL_RenderTexture(renderer, magnetTex, nullptr, &dst);
@@ -1812,6 +1925,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(overCoinsText);
     DestroyCached(overTimeText);
     DestroyCached(hudComboText);
+    DestroyCached(nicePopupText);
     if (arrowTex) { SDL_DestroyTexture(arrowTex); arrowTex = nullptr; }
     if (cursorTex) { SDL_DestroyTexture(cursorTex); cursorTex = nullptr; }
     for (auto &pl : pausedLetters) {
