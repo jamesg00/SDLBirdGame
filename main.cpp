@@ -1260,6 +1260,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     bool isPerfect = (SDL_fabsf(dx) <= tolX && SDL_fabsf(dy) <= tolY);
 
                     int points = (comboCount + 1 >= 10) ? 3 : 1;
+                    if (comboCount + 1 >= 10) comboCount += 3;
+                    else comboCount++;
                     if (isPerfect) points += 1;
                     score += points;
                     comboCount++;
