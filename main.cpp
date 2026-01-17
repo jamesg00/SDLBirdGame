@@ -19,6 +19,7 @@
 #include "core/sprite_anim.h"
 #include "core/floating_text.h"
 #include "audio/audio.h"
+#include "records/record.h"
 
 
 
@@ -52,6 +53,7 @@ static int coinCount = 0;
 static float gameTimer = 0.0f; // seconds
 bool playerDead = false;
 static int score = 0;
+static int bestScore = 0;
 static int comboCount = 0;
 static float comboTimer = 0.0f;
 static const float comboTimeout = 3.0f;
@@ -101,13 +103,18 @@ struct CachedText {
 static CachedText hudCoinText;
 static CachedText hudTimeText;
 static CachedText hudComboText;
+static CachedText hudBestScoreText;
+static CachedText hudScoreText;
 static CachedText menuTitleText;
 static CachedText menuStartText;
 static CachedText menuOptionsText;
 static CachedText optionsStateText;
 static CachedText overTitleText;
 static CachedText overCoinsText;
+static CachedText overScoreText;
 static CachedText overTimeText;
+static CachedText overBestScoreText;
+static CachedText overRestartText;
 static CachedText newRecordText;
 static CachedText perfectShotText;
 static CachedText nicePopupText;
@@ -120,6 +127,27 @@ struct ComboPopup {
     float lifetime = 2.0f;
 };
 static std::vector<ComboPopup> comboPopups;
+
+struct BeatScorePopup {
+    SDL_FPoint pos;
+    float timer = 0.0f;
+    float lifetime = 2.0f;
+};
+static std::vector<BeatScorePopup> beatScorePopups;
+static bool beatScoreAnnounced = false;
+static GameRecord record;
+
+struct WaveTextCache {
+    std::string text;
+    std::vector<CachedText> letters;
+};
+static WaveTextCache overCoinsWave;
+static WaveTextCache overScoreWave;
+static WaveTextCache overTimeWave;
+static WaveTextCache overBestScoreWave;
+static WaveTextCache overRestartWave;
+static WaveTextCache overTitleWave;
+static WaveTextCache overNewRecordWave;
 
 static SDL_Color HSVToRGB(float hDeg, float s, float v) {
     float h = fmodf(hDeg, 360.0f);
@@ -274,6 +302,139 @@ static void RenderWaveTitle(const std::string &text, float centerX, float baseY)
     }
 }
 
+static void ClearWaveTextCache(WaveTextCache &cache) {
+    for (auto &c : cache.letters) DestroyCached(c);
+    cache.letters.clear();
+    cache.text.clear();
+}
+
+static float EnsureWaveTextCache(WaveTextCache &cache, const std::string &text, SDL_Color col, float spacing) {
+    if (text != cache.text) {
+        ClearWaveTextCache(cache);
+        cache.letters.resize(text.size());
+        cache.text = text;
+    }
+    float totalW = 0.0f;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char cstr[2] = {text[i], '\0'};
+        UpdateCachedText(cache.letters[i], cstr, col);
+        totalW += cache.letters[i].w + spacing;
+    }
+    if (!text.empty()) totalW -= spacing;
+    return totalW;
+}
+
+static void RenderWaveTextAtX(const WaveTextCache &cache, float startX, float baseY, double t,
+                              float waveAmp, float waveFreq, float phaseStep, SDL_Color col, float spacing) {
+    float x = startX;
+    for (size_t i = 0; i < cache.letters.size(); ++i) {
+        const auto &ct = cache.letters[i];
+        if (!ct.tex) continue;
+        float waveY = SDL_sinf((float)(t * waveFreq + phaseStep * (float)i)) * waveAmp;
+        SDL_FRect shadow{ x + 2.0f, baseY + waveY + 2.0f, ct.w, ct.h };
+        SDL_SetTextureColorMod(ct.tex, 0, 0, 0);
+        SDL_SetTextureAlphaMod(ct.tex, 170);
+        SDL_RenderTexture(renderer, ct.tex, nullptr, &shadow);
+        SDL_SetTextureColorMod(ct.tex, col.r, col.g, col.b);
+        SDL_SetTextureAlphaMod(ct.tex, 255);
+        SDL_FRect dst{ x, baseY + waveY, ct.w, ct.h };
+        SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
+        x += ct.w + spacing;
+    }
+}
+
+static void RenderWaveLineCentered(WaveTextCache &cache, const std::string &text, float centerX, float baseY,
+                                   double t, float waveAmp, float waveFreq, float phaseStep, SDL_Color col) {
+    const float spacing = 2.0f;
+    float totalW = EnsureWaveTextCache(cache, text, col, spacing);
+    float startX = centerX - totalW * 0.5f;
+    RenderWaveTextAtX(cache, startX, baseY, t, waveAmp, waveFreq, phaseStep, col, spacing);
+}
+
+static bool GetBestScoreHudRect(SDL_FRect &outRect) {
+    if (!font) return false;
+    std::string label = "Best " + std::to_string(bestScore);
+    int w = 0, h = 0;
+    if (!TTF_GetStringSize(font, label.c_str(), label.size(), &w, &h)) return false;
+    const float margin = 16.0f;
+    outRect = SDL_FRect{ margin, 10.0f, (float)w, (float)h };
+    return true;
+}
+
+static std::vector<CachedWaveLetter> beatScoreLetterCache;
+static std::string cachedBeatScoreLabel;
+
+static void BuildBeatScoreCache(const std::string &text) {
+    if (!font) return;
+    if (text == cachedBeatScoreLabel && !beatScoreLetterCache.empty()) return;
+    for (auto &c : beatScoreLetterCache) {
+        if (c.tex) SDL_DestroyTexture(c.tex);
+    }
+    beatScoreLetterCache.clear();
+    cachedBeatScoreLabel = text;
+    SDL_Color white{255, 255, 255, 255};
+    for (char ch : text) {
+        char buf[2] = {ch, '\0'};
+        SDL_Surface *surf = TTF_RenderText_Blended(font, buf, 0, white);
+        if (!surf) continue;
+        CachedWaveLetter letter;
+        letter.tex = SDL_CreateTextureFromSurface(renderer, surf);
+        letter.w = (float)surf->w;
+        letter.h = (float)surf->h;
+        SDL_DestroySurface(surf);
+        beatScoreLetterCache.push_back(letter);
+    }
+}
+
+static void TriggerBeatScorePopup() {
+    SDL_FRect bestRect;
+    if (!GetBestScoreHudRect(bestRect)) return;
+    BeatScorePopup popup;
+    popup.pos.x = bestRect.x + bestRect.w + 2.0f;
+    popup.pos.y = bestRect.y;
+    beatScorePopups.push_back(popup);
+}
+
+static void RenderBeatScorePopup(const BeatScorePopup &bp) {
+    const std::string text = "Beat Score!";
+    BuildBeatScoreCache(text);
+    if (beatScoreLetterCache.empty()) return;
+
+    const float spacing = 1.0f;
+
+    double tNow = (double)SDL_GetTicks() / 1000.0;
+    float tNorm = bp.timer / bp.lifetime;
+    float rise = 18.0f;
+    float baseY = bp.pos.y - rise * tNorm;
+    float x = bp.pos.x;
+    float waveAmp = 6.0f;
+    float waveFreq = 3.5f;
+    float phaseStep = 0.6f;
+
+    Uint8 alpha = 255;
+    if (tNorm > 0.7f) {
+        float fade = (1.0f - (tNorm - 0.7f) / 0.3f);
+        if (fade < 0.0f) fade = 0.0f;
+        alpha = (Uint8)SDL_roundf(255.0f * fade);
+    }
+
+    for (size_t i = 0; i < beatScoreLetterCache.size(); ++i) {
+        const auto &letter = beatScoreLetterCache[i];
+        if (!letter.tex) continue;
+        float waveY = SDL_sinf((float)tNow * waveFreq + phaseStep * (float)i) * waveAmp;
+        SDL_Color col = RainbowColor((float)tNow, 25.0f * (float)i);
+        SDL_SetTextureColorMod(letter.tex, 0, 0, 0);
+        SDL_SetTextureAlphaMod(letter.tex, (Uint8)SDL_roundf(alpha * 0.6f));
+        SDL_FRect shadow{ x + 2.0f, baseY + waveY + 2.0f, letter.w, letter.h };
+        SDL_RenderTexture(renderer, letter.tex, nullptr, &shadow);
+        SDL_SetTextureColorMod(letter.tex, col.r, col.g, col.b);
+        SDL_SetTextureAlphaMod(letter.tex, alpha);
+        SDL_FRect dst{ x, baseY + waveY, letter.w, letter.h };
+        SDL_RenderTexture(renderer, letter.tex, nullptr, &dst);
+        x += letter.w + spacing;
+    }
+
+}
 
 static void RenderLabel(const std::string &text, float x, float y) {
     if (!font || text.empty()) return;
@@ -303,6 +464,34 @@ static void RenderLabel(const std::string &text, float x, float y) {
     }
     if (texShadow) SDL_DestroyTexture(texShadow);
     if (texMain) SDL_DestroyTexture(texMain);
+}
+
+static void RenderCachedTextShadowed(const CachedText &ct, float x, float y, float alpha = 255.0f) {
+    if (!ct.tex) return;
+    Uint8 a = (Uint8)SDL_roundf(alpha);
+    SDL_SetTextureColorMod(ct.tex, 0, 0, 0);
+    SDL_SetTextureAlphaMod(ct.tex, (Uint8)SDL_roundf(a * 0.6f));
+    SDL_FRect shadow{ x + 2.0f, y + 2.0f, ct.w, ct.h };
+    SDL_RenderTexture(renderer, ct.tex, nullptr, &shadow);
+    SDL_SetTextureColorMod(ct.tex, 255, 255, 255);
+    SDL_SetTextureAlphaMod(ct.tex, a);
+    SDL_FRect dst{ x, y, ct.w, ct.h };
+    SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
+}
+
+static void RenderCachedTextShadowedScaled(const CachedText &ct, float x, float y, float scale, float alpha = 255.0f) {
+    if (!ct.tex) return;
+    float w = ct.w * scale;
+    float h = ct.h * scale;
+    Uint8 a = (Uint8)SDL_roundf(alpha);
+    SDL_SetTextureColorMod(ct.tex, 0, 0, 0);
+    SDL_SetTextureAlphaMod(ct.tex, (Uint8)SDL_roundf(a * 0.6f));
+    SDL_FRect shadow{ x + 2.0f, y + 2.0f, w, h };
+    SDL_RenderTexture(renderer, ct.tex, nullptr, &shadow);
+    SDL_SetTextureColorMod(ct.tex, 255, 255, 255);
+    SDL_SetTextureAlphaMod(ct.tex, a);
+    SDL_FRect dst{ x, y, w, h };
+    SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
 }
 
 static bool LoadPausedLetters(SDL_Renderer *r, TTF_Font *f) {
@@ -399,6 +588,8 @@ inline bool IsPlayingActive() { return gameState == GameState::Playing && !playe
 
 static int hudLastCoins = -1;
 static int hudLastTime = -1;
+static int hudLastBestScore = -1;
+static int hudLastScore = -1;
 static float musicVolumeSetting = 0.1f; // 0..1
 static float sfxVolumeSetting = 0.1f;    // 0..1
 static bool draggingMusicSlider = false;
@@ -461,6 +652,8 @@ static void ResetGameState() {
     comboTimer = 0.0f;
     DestroyCached(hudComboText);
     comboPopups.clear();
+    beatScorePopups.clear();
+    beatScoreAnnounced = false;
     coinSpinBoostTimer = 0.0f;
     gCoinSpinMultiplier = 1.0f;
     hudCoinAnimTimer = 0.0f;
@@ -472,6 +665,25 @@ static void ResetGameState() {
     powerups.clear();
     powerupSpawnTimer = 0.0f;
     powerupSpawnInterval = 10.0f;
+}
+
+static void UpdateRecordsOnGameOver() {
+    newRecord = false;
+    bool recordChanged = false;
+    if (score > bestScore) {
+        bestScore = score;
+        record.bestScore = score;
+        recordChanged = true;
+    }
+    if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
+        bestCoins = coinCount;
+        bestTime = gameTimer;
+        record.bestCoins = bestCoins;
+        record.bestTime = bestTime;
+        newRecord = true;
+        recordChanged = true;
+    }
+    if (recordChanged) SaveRecord(record);
 }
 
 
@@ -592,6 +804,19 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     optionsStateText.text.clear(); // will be set on render
     hudLastCoins = -1;
     hudLastTime = -1;
+    hudLastBestScore = -1;
+    hudLastScore = -1;
+
+    if (LoadRecord(record)) {
+        bestScore = record.bestScore;
+        bestCoins = record.bestCoins;
+        bestTime = record.bestTime;
+    } else {
+        record = GameRecord{};
+        bestScore = 0;
+        bestCoins = 0;
+        bestTime = 0.0f;
+    }
 
 
 
@@ -846,6 +1071,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     for (auto &cp : comboPopups) cp.timer += dt;
     comboPopups.erase(std::remove_if(comboPopups.begin(), comboPopups.end(),
         [](const ComboPopup &cp){ return cp.timer >= cp.lifetime; }), comboPopups.end());
+    for (auto &bp : beatScorePopups) bp.timer += dt;
+    beatScorePopups.erase(std::remove_if(beatScorePopups.begin(), beatScorePopups.end(),
+        [](const BeatScorePopup &bp){ return bp.timer >= bp.lifetime; }), beatScorePopups.end());
 
     if (IsPlayingActive()) {
         if (waitingForStart && flyKeyDown) {
@@ -871,13 +1099,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         comboTimer = 0.0f;
         UpdateComboText();
         gameState = GameState::GameOver;
-        if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
-            bestCoins = coinCount;
-            bestTime = gameTimer;
-            newRecord = true;
-        } else {
-            newRecord = false;
-        }
+        UpdateRecordsOnGameOver();
         SDL_SetWindowMouseGrab(window, false);
         SDL_ShowCursor();
     }
@@ -899,6 +1121,10 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         } else {
             gCoinSpinMultiplier = 1.0f;
         }
+    } else if (gameState == GameState::GameOver) {
+        gCoinSpinMultiplier = 1.0f;
+    }
+    if (gameState == GameState::Playing || gameState == GameState::GameOver) {
         hudCoinAnimTimer += dt * gCoinSpinMultiplier;
         const float frameTime = 0.1f;
         while (hudCoinAnimTimer >= frameTime) {
@@ -1264,6 +1490,13 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     else comboCount++;
                     if (isPerfect) points += 1;
                     score += points;
+                    if (!beatScoreAnnounced && score > bestScore) {
+                        bestScore = score;
+                        record.bestScore = bestScore;
+                        SaveRecord(record);
+                        beatScoreAnnounced = true;
+                        TriggerBeatScorePopup();
+                    }
                     comboCount++;
                     comboTimer = comboTimeout;
                     UpdateComboText();
@@ -1305,13 +1538,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 UpdateComboText();
                 gameState = GameState::GameOver;
                 // update records
-                if (coinCount > bestCoins || (coinCount == bestCoins && gameTimer > bestTime)) {
-                    bestCoins = coinCount;
-                    bestTime = gameTimer;
-                    newRecord = true;
-                } else {
-                    newRecord = false;
-                }
+                UpdateRecordsOnGameOver();
                 SDL_SetWindowMouseGrab(window, false);
                 SDL_ShowCursor();
                 break;
@@ -1444,6 +1671,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         SDL_snprintf(timeBuf, sizeof(timeBuf), "%02d %02d", minutes, seconds);
         std::string coinLabel = std::to_string(coinCount);
         std::string timeLabel = std::string("Time ") + timeBuf;
+        std::string bestLabel = "Best " + std::to_string(bestScore);
+        std::string scoreLabel = "Score " + std::to_string(score);
         SDL_Color white{255,255,255,255};
         if (coinCount != hudLastCoins) {
             hudLastCoins = coinCount;
@@ -1453,9 +1682,33 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             hudLastTime = totalSeconds;
             UpdateCachedText(hudTimeText, timeLabel, white);
         }
+        if (bestScore != hudLastBestScore) {
+            hudLastBestScore = bestScore;
+            UpdateCachedText(hudBestScoreText, bestLabel, white);
+        }
+        if (score != hudLastScore) {
+            hudLastScore = score;
+            UpdateCachedText(hudScoreText, scoreLabel, white);
+        }
         float margin = 16.0f;
         double hudT = (double)SDL_GetTicks() / 1000.0;
         float bob = SDL_sinf((float)hudT * 3.0f) * 2.5f;
+        if (hudBestScoreText.tex) {
+            float bestX = margin;
+            SDL_FRect shadow{ bestX + 2.0f, 10.0f + bob + 2.0f, hudBestScoreText.w, hudBestScoreText.h };
+            SDL_SetTextureColorMod(hudBestScoreText.tex, 0,0,0);
+            SDL_SetTextureAlphaMod(hudBestScoreText.tex, 160);
+            SDL_RenderTexture(renderer, hudBestScoreText.tex, nullptr, &shadow);
+            SDL_SetTextureColorMod(hudBestScoreText.tex, 255,255,255);
+            SDL_SetTextureAlphaMod(hudBestScoreText.tex, 255);
+            SDL_FRect dst{ bestX, 10.0f + bob, hudBestScoreText.w, hudBestScoreText.h };
+            SDL_RenderTexture(renderer, hudBestScoreText.tex, nullptr, &dst);
+        }
+        if (hudScoreText.tex) {
+            float scoreX = margin;
+            float scoreY = 32.0f + bob;
+            RenderCachedTextShadowed(hudScoreText, scoreX, scoreY);
+        }
         if (hudCoinText.tex && coinFrames[0]) {
             float coinX = (float)kWinW - hudCoinText.w - margin;
             SDL_FRect shadow{ coinX + 2.0f, 10.0f + bob + 2.0f, hudCoinText.w, hudCoinText.h };
@@ -1561,6 +1814,12 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             }
             SDL_SetTextureColorMod(nicePopupText.tex, 255, 255, 255);
             SDL_SetTextureAlphaMod(nicePopupText.tex, 255);
+        }
+
+        if (!beatScorePopups.empty()) {
+            for (const auto &bp : beatScorePopups) {
+                RenderBeatScorePopup(bp);
+            }
         }
 
         if (showFlyHint && font) {
@@ -1841,42 +2100,99 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     // Game over overlay
     if (gameState == GameState::GameOver) {
-        if (overTitleText.tex) {
-            SDL_FRect dst{ kWinW * 0.5f - overTitleText.w * 0.5f, kWinH * 0.5f - 40.0f, overTitleText.w, overTitleText.h };
-            SDL_RenderTexture(renderer, overTitleText.tex, nullptr, &dst);
-        }
         int totalSeconds = (int)gameTimer;
         int minutes = totalSeconds / 60;
         int seconds = totalSeconds % 60;
         char timeBuf[8];
         SDL_snprintf(timeBuf, sizeof(timeBuf), "%02d %02d", minutes, seconds);
         SDL_Color white{255,255,255,255};
-        UpdateCachedText(overCoinsText, "Coins " + std::to_string(coinCount), white);
-        UpdateCachedText(overTimeText, std::string("Time ") + timeBuf, white);
-
         double t = (double)SDL_GetTicks() / 1000.0;
-        float yOffset = SDL_sinf((float)(t * 3.0f)) * 4.0f;
-        float margin = 14.0f;
-        if (overCoinsText.tex) {
-            SDL_FRect dst{ kWinW - overCoinsText.w - margin, 14.0f + yOffset, overCoinsText.w, overCoinsText.h };
-            SDL_RenderTexture(renderer, overCoinsText.tex, nullptr, &dst);
+        float centerX = kWinW * 0.5f;
+        float y = kWinH * 0.5f - 150.0f;
+        const float bobAmp = 6.0f;
+        const float bobFreq = 2.8f;
+
+        UpdateCachedText(overTitleText, "GAME OVER!", white);
+        UpdateCachedText(overCoinsText, "Coins " + std::to_string(coinCount), white);
+        UpdateCachedText(overScoreText, "Score " + std::to_string(score), white);
+        UpdateCachedText(overTimeText, std::string("Time ") + timeBuf, white);
+        UpdateCachedText(overBestScoreText, "Best " + std::to_string(bestScore), white);
+        UpdateCachedText(newRecordText, "NEW RECORD!", white);
+        UpdateCachedText(overRestartText, "ESC TO RESTART", white);
+
+        auto bobY = [&](float phase) {
+            return SDL_sinf((float)(t * bobFreq + phase)) * bobAmp;
+        };
+
+        if (overTitleText.tex) {
+            float yOff = bobY(0.0f);
+            float x = centerX - overTitleText.w * 0.5f;
+            RenderCachedTextShadowed(overTitleText, x, y + yOff);
         }
-        if (overTimeText.tex) {
-            SDL_FRect dst{ kWinW - overTimeText.w - margin, 36.0f + yOffset, overTimeText.w, overTimeText.h };
-            SDL_RenderTexture(renderer, overTimeText.tex, nullptr, &dst);
+        y += 42.0f;
+
+        {
+            float yOff = bobY(0.6f);
+            float scale = 0.8f;
+            float iconSize = 28.0f * scale;
+            float gap = 6.0f;
+            float blockGap = 18.0f;
+            float lineW = iconSize + gap;
+            if (overCoinsText.tex) lineW += overCoinsText.w * scale;
+            if (overScoreText.tex) lineW += blockGap + overScoreText.w * scale;
+            if (overTimeText.tex) lineW += blockGap + overTimeText.w * scale;
+            float startX = centerX - lineW * 0.5f;
+            float lineH = iconSize;
+            if (overCoinsText.tex) lineH = SDL_max(lineH, overCoinsText.h * scale);
+            if (overScoreText.tex) lineH = SDL_max(lineH, overScoreText.h * scale);
+            if (overTimeText.tex) lineH = SDL_max(lineH, overTimeText.h * scale);
+
+            float padX = 10.0f;
+            float padY = 6.0f;
+            SDL_FRect bg{ startX - padX, y + yOff - padY, lineW + padX * 2.0f, lineH + padY * 2.0f };
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(renderer, 0, 0, 0, 77);
+            SDL_RenderFillRect(renderer, &bg);
+
+            SDL_Texture *cTex = coinFrames[hudCoinFrame];
+            if (cTex) {
+                float textH = overCoinsText.tex ? overCoinsText.h * scale : 0.0f;
+                SDL_FRect cdst{ startX, y + yOff + (textH - iconSize) * 0.5f, iconSize, iconSize };
+                SDL_RenderTexture(renderer, cTex, nullptr, &cdst);
+            }
+            float cursorX = startX + iconSize + gap;
+            if (overCoinsText.tex) {
+                RenderCachedTextShadowedScaled(overCoinsText, cursorX, y + yOff, scale);
+                cursorX += overCoinsText.w * scale + blockGap;
+            }
+            if (overScoreText.tex) {
+                RenderCachedTextShadowedScaled(overScoreText, cursorX, y + yOff, scale);
+                cursorX += overScoreText.w * scale + blockGap;
+            }
+            if (overTimeText.tex) {
+                RenderCachedTextShadowedScaled(overTimeText, cursorX, y + yOff, scale);
+            }
         }
+        y += 42.0f;
+        if (overBestScoreText.tex) {
+            float yOff = bobY(2.4f);
+            float x = centerX - overBestScoreText.w * 0.5f;
+            RenderCachedTextShadowed(overBestScoreText, x, y + yOff);
+        }
+        y += 40.0f;
 
         if (newRecord && newRecordText.tex) {
-            float recY = kWinH * 0.5f + 10.0f + SDL_sinf((float)(t * 3.5f)) * 8.0f;
-            Uint8 r = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.0f));
-            Uint8 g = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.4f + 2.0f));
-            Uint8 b = (Uint8)(128 + 127 * SDL_sinf((float)t * 2.8f + 4.0f));
-            SDL_SetTextureColorMod(newRecordText.tex, r, g, b);
-            SDL_FRect dst{ kWinW * 0.5f - newRecordText.w * 0.5f, recY, newRecordText.w, newRecordText.h };
-            SDL_RenderTexture(renderer, newRecordText.tex, nullptr, &dst);
+            float yOff = bobY(3.0f);
+            float x = centerX - newRecordText.w * 0.5f;
+            RenderCachedTextShadowed(newRecordText, x, y + yOff);
+            y += 36.0f;
         }
 
-        RenderLabel("ESC TO RESTART", kWinW * 0.5f - 120.0f, kWinH * 0.5f + 100.0f);
+        if (overRestartText.tex) {
+            float yOff = bobY(3.6f);
+            float x = centerX - overRestartText.w * 0.5f;
+            RenderCachedTextShadowed(overRestartText, x, y + yOff);
+        }
     }
 
 
@@ -1919,13 +2235,18 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     if (textTex) { SDL_DestroyTexture(textTex); textTex = nullptr; }
     DestroyCached(hudCoinText);
     DestroyCached(hudTimeText);
+    DestroyCached(hudBestScoreText);
+    DestroyCached(hudScoreText);
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);
     DestroyCached(overCoinsText);
+    DestroyCached(overScoreText);
     DestroyCached(overTimeText);
+    DestroyCached(overBestScoreText);
+    DestroyCached(overRestartText);
     DestroyCached(hudComboText);
     DestroyCached(nicePopupText);
     if (arrowTex) { SDL_DestroyTexture(arrowTex); arrowTex = nullptr; }
@@ -1948,13 +2269,18 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     }
     DestroyCached(hudCoinText);
     DestroyCached(hudTimeText);
+    DestroyCached(hudBestScoreText);
+    DestroyCached(hudScoreText);
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);
     DestroyCached(overCoinsText);
+    DestroyCached(overScoreText);
     DestroyCached(overTimeText);
+    DestroyCached(overBestScoreText);
+    DestroyCached(overRestartText);
     DestroyCached(newRecordText);
 
     if (font) { TTF_CloseFont(font); font = nullptr; }
@@ -1964,6 +2290,18 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
         projectileFrames[i] = nullptr;
     }
     }
+    ClearWaveTextCache(overCoinsWave);
+    ClearWaveTextCache(overScoreWave);
+    ClearWaveTextCache(overTimeWave);
+    ClearWaveTextCache(overBestScoreWave);
+    ClearWaveTextCache(overRestartWave);
+    ClearWaveTextCache(overTitleWave);
+    ClearWaveTextCache(overNewRecordWave);
+    for (auto &c : beatScoreLetterCache) {
+        if (c.tex) SDL_DestroyTexture(c.tex);
+    }
+    beatScoreLetterCache.clear();
+    cachedBeatScoreLabel.clear();
     TTF_Quit();
     SDL_Quit();
 }

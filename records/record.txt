@@ -1,0 +1,3 @@
+best_score=102
+best_coins=34
+best_time=62.9022
