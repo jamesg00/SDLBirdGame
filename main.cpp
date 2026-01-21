@@ -108,6 +108,7 @@ static CachedText hudScoreText;
 static CachedText menuTitleText;
 static CachedText menuStartText;
 static CachedText menuOptionsText;
+static CachedText menuQuitText;
 static CachedText optionsStateText;
 static CachedText overTitleText;
 static CachedText overCoinsText;
@@ -118,6 +119,7 @@ static CachedText overRestartText;
 static CachedText newRecordText;
 static CachedText perfectShotText;
 static CachedText nicePopupText;
+static CachedText hudMenuText;
 
 static int frameCounter = 0;
 
@@ -603,6 +605,7 @@ struct MenuButton {
 };
 static MenuButton btnStart{ "START", {0,0,0,0}, false, 0.0f };
 static MenuButton btnOptions{ "OPTIONS", {0,0,0,0}, false, 0.4f };
+static MenuButton btnQuit{ "QUIT", {0,0,0,0}, false, 0.8f };
 struct Demo {
     SDL_FPoint pos{240.0f, 260.0f};
     SDL_FPoint vel{80.0f, 0.0f};
@@ -665,6 +668,17 @@ static void ResetGameState() {
     powerups.clear();
     powerupSpawnTimer = 0.0f;
     powerupSpawnInterval = 10.0f;
+}
+
+static void GoToMenuFromGame() {
+    gameState = GameState::Menu;
+    playerDead = false;
+    player.dead = false;
+    waitingForStart = true;
+    showFlyHint = true;
+    optionsFromPaused = false;
+    SDL_SetWindowMouseGrab(window, false);
+    SDL_ShowCursor();
 }
 
 static void UpdateRecordsOnGameOver() {
@@ -797,9 +811,11 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     UpdateCachedText(menuTitleText, "Arr0wB1rd", white);
     UpdateCachedText(menuStartText, "START", white);
     UpdateCachedText(menuOptionsText, "OPTIONS", white);
+    UpdateCachedText(menuQuitText, "QUIT", white);
     UpdateCachedText(overTitleText, "GAME OVER!", white);
     UpdateCachedText(newRecordText, "NEW RECORD!", white);
     UpdateCachedText(nicePopupText, "NICE!", white);
+    UpdateCachedText(hudMenuText, "MENU", white);
     
     optionsStateText.text.clear(); // will be set on render
     hudLastCoins = -1;
@@ -1354,6 +1370,22 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             gameState = GameState::Options;
             SDL_ShowCursor();
             SDL_SetWindowMouseGrab(window, false);
+        } else if (btnQuit.hover) {
+            SDL_Event quitEvent;
+            quitEvent.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quitEvent);
+        }
+    }
+
+    if (gameState == GameState::Playing && mouseDown && !wasMouseDown) {
+        if (hudMenuText.tex) {
+            double tNow = (double)SDL_GetTicks() / 1000.0;
+            float bob = SDL_sinf((float)tNow * 3.0f) * 2.5f;
+            float x = 16.0f;
+            float y = 54.0f + bob;
+            if (mx >= x && mx <= x + hudMenuText.w && my >= y && my <= y + hudMenuText.h) {
+                GoToMenuFromGame();
+            }
         }
     }
 
@@ -1709,6 +1741,25 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             float scoreY = 32.0f + bob;
             RenderCachedTextShadowed(hudScoreText, scoreX, scoreY);
         }
+        if (hudMenuText.tex) {
+            float hmx = 0.0f, hmy = 0.0f;
+            Uint32 hstate = 0;
+            GetLogicalMouse(hmx, hmy, hstate);
+            float menuX = margin;
+            float menuY = 54.0f + bob;
+            bool hover = (hmx >= menuX && hmx <= menuX + hudMenuText.w &&
+                          hmy >= menuY && hmy <= menuY + hudMenuText.h);
+            Uint8 alpha = hover ? 255 : 200;
+            SDL_FRect shadow{ menuX + 2.0f, menuY + 2.0f, hudMenuText.w, hudMenuText.h };
+            SDL_SetTextureColorMod(hudMenuText.tex, 0,0,0);
+            SDL_SetTextureAlphaMod(hudMenuText.tex, 160);
+            SDL_RenderTexture(renderer, hudMenuText.tex, nullptr, &shadow);
+            SDL_SetTextureColorMod(hudMenuText.tex, 255,255,255);
+            SDL_SetTextureAlphaMod(hudMenuText.tex, alpha);
+            SDL_FRect dst{ menuX, menuY, hudMenuText.w, hudMenuText.h };
+            SDL_RenderTexture(renderer, hudMenuText.tex, nullptr, &dst);
+            SDL_SetTextureAlphaMod(hudMenuText.tex, 255);
+        }
         if (hudCoinText.tex && coinFrames[0]) {
             float coinX = (float)kWinW - hudCoinText.w - margin;
             SDL_FRect shadow{ coinX + 2.0f, 10.0f + bob + 2.0f, hudCoinText.w, hudCoinText.h };
@@ -1995,6 +2046,11 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         btnOptions.bounds.h = menuOptionsText.h;
         btnOptions.bounds.x = kWinW * 0.5f - btnOptions.bounds.w * 0.5f;
         btnOptions.bounds.y = 160.0f;
+        
+        btnQuit.bounds.w = menuQuitText.w;
+        btnQuit.bounds.h = menuQuitText.h;
+        btnQuit.bounds.x = kWinW * 0.5f - btnQuit.bounds.w * 0.5f;
+        btnQuit.bounds.y = 200.0f;
 
         Uint32 mstate = SDL_GetMouseState(nullptr, nullptr);
         float mx=0.0f, my=0.0f; GetLogicalMouse(mx,my);
@@ -2005,15 +2061,19 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         if (gameState == GameState::Menu) {
             hoverCheck(btnStart);
             hoverCheck(btnOptions);
+            hoverCheck(btnQuit);
         } else {
-            btnStart.hover = btnOptions.hover = false;
+            btnStart.hover = btnOptions.hover = btnQuit.hover = false;
         }
 
         auto renderButton = [&](const MenuButton &b, float phase){
             float hoverWave = b.hover ? SDL_sinf((float)t * 4.0f + phase) * 4.0f : 0.0f;
             Uint8 alpha = b.hover ? (Uint8)(200 + 55 * (0.5f + 0.5f * SDL_sinf((float)t * 6.0f + phase))) : 255;
-            CachedText *ct = (b.label == "START") ? &menuStartText : &menuOptionsText;
-            if (ct->tex) {
+            CachedText *ct = nullptr;
+            if (b.label == "START") ct = &menuStartText;
+            else if (b.label == "OPTIONS") ct = &menuOptionsText;
+            else if (b.label == "QUIT") ct = &menuQuitText;
+            if (ct && ct->tex) {
                 SDL_FRect dst{ b.bounds.x, b.bounds.y + hoverWave, ct->w, ct->h };
                 SDL_FRect s1{ dst.x + 2.0f, dst.y + 2.0f, dst.w, dst.h };
                 SDL_FRect s2{ dst.x + 4.0f, dst.y + 4.0f, dst.w, dst.h };
@@ -2029,6 +2089,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         if (gameState == GameState::Menu) {
             renderButton(btnStart, 0.0f);
             renderButton(btnOptions, 1.0f);
+            renderButton(btnQuit, 2.0f);
         }
 
         // demo player + arrow + demo shots
@@ -2240,6 +2301,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
+    DestroyCached(menuQuitText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);
     DestroyCached(overCoinsText);
@@ -2249,6 +2311,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(overRestartText);
     DestroyCached(hudComboText);
     DestroyCached(nicePopupText);
+    DestroyCached(hudMenuText);
     if (arrowTex) { SDL_DestroyTexture(arrowTex); arrowTex = nullptr; }
     if (cursorTex) { SDL_DestroyTexture(cursorTex); cursorTex = nullptr; }
     for (auto &pl : pausedLetters) {
@@ -2274,6 +2337,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
+    DestroyCached(menuQuitText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);
     DestroyCached(overCoinsText);
@@ -2282,6 +2346,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(overBestScoreText);
     DestroyCached(overRestartText);
     DestroyCached(newRecordText);
+    DestroyCached(hudMenuText);
 
     if (font) { TTF_CloseFont(font); font = nullptr; }
     for (int i = 0; i < 30; ++i) {
