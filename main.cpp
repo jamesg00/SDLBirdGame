@@ -223,7 +223,9 @@ struct MpPlayer {
     int id = -1;
     std::string name;
     SDL_FRect rect{0,0,40,40};
+    SDL_FRect targetRect{0,0,40,40};
     SDL_FPoint vel{0.0f, 0.0f};
+    SDL_FPoint targetVel{0.0f, 0.0f};
     bool alive = false;
     bool facingRight = true;
     bool wasJumpDown = false;
@@ -234,6 +236,8 @@ struct MpPlayer {
     bool invincible = false;
     float invincibleTimer = 0.0f;
     float respawnTimer = 0.0f;
+    bool connected = true;
+    bool hasTarget = false;
 };
 
 struct MpProjectile {
@@ -896,13 +900,18 @@ static void NetSendSnapshot() {
     SnapshotHeader hdr{};
     hdr.type = (Uint8)NetMsg::Snapshot;
     hdr.matchTimer = mpMatchTimer;
-    hdr.playerCount = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+    hdr.playerCount = 0;
     hdr.batCount = (Uint8)SDL_min((int)mpBats.size(), kMpMaxBats);
     hdr.projCount = (Uint16)SDL_min((int)mpProjectiles.size(), kMpMaxProjectiles);
+    for (const auto &p : mpPlayers) {
+        if (p.connected) hdr.playerCount++;
+    }
     WriteBytes(buf, &hdr, sizeof(hdr));
 
-    for (int i = 0; i < hdr.playerCount; ++i) {
-        const auto &p = mpPlayers[i];
+    int sent = 0;
+    for (const auto &p : mpPlayers) {
+        if (!p.connected) continue;
+        if (sent >= hdr.playerCount) break;
         WriteValue(buf, (Uint8)p.id);
         char nameBuf[kMpNameLen] = {};
         SDL_strlcpy(nameBuf, p.name.c_str(), sizeof(nameBuf));
@@ -919,6 +928,7 @@ static void NetSendSnapshot() {
         WriteValue(buf, p.score);
         WriteValue(buf, (Uint8)(p.invincible ? 1 : 0));
         WriteValue(buf, p.respawnTimer);
+        sent++;
     }
 
     for (int i = 0; i < hdr.batCount; ++i) {
@@ -960,13 +970,27 @@ static void NetSendMatchOver() {
     enet_host_broadcast(netHost, 0, packet);
 }
 
+static MpPlayer* FindMpPlayer(int id) {
+    for (auto &p : mpPlayers) {
+        if (p.id == id) return &p;
+    }
+    return nullptr;
+}
+
+static int FindFreePlayerId() {
+    for (int id = 0; id < kMpMaxPlayers; ++id) {
+        if (!FindMpPlayer(id)) return id;
+    }
+    return -1;
+}
+
 static void NetHandleSnapshot(const Uint8 *data, size_t len) {
     size_t off = 0;
     SnapshotHeader hdr{};
     if (!ReadBytes(data, len, off, &hdr, sizeof(hdr))) return;
     mpMatchTimer = hdr.matchTimer;
 
-    mpPlayers.clear();
+    std::vector<int> incomingIds;
     for (int i = 0; i < hdr.playerCount; ++i) {
         MpPlayer p;
         Uint8 id = 0;
@@ -997,8 +1021,36 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
         p.invincible = inv != 0;
         p.rect.w = 40.0f;
         p.rect.h = 40.0f;
-        mpPlayers.push_back(p);
+        p.targetRect = p.rect;
+        p.targetVel = p.vel;
+        p.connected = true;
+        p.hasTarget = true;
+        incomingIds.push_back(id);
+
+        MpPlayer *existing = FindMpPlayer(id);
+        if (existing) {
+            existing->targetRect = p.rect;
+            existing->targetVel = p.vel;
+            existing->alive = p.alive;
+            existing->facingRight = p.facingRight;
+            existing->health = p.health;
+            existing->kills = p.kills;
+            existing->deaths = p.deaths;
+            existing->score = p.score;
+            existing->invincible = p.invincible;
+            existing->respawnTimer = p.respawnTimer;
+            existing->name = p.name;
+            existing->connected = true;
+            existing->hasTarget = true;
+        } else {
+            mpPlayers.push_back(p);
+        }
     }
+
+    mpPlayers.erase(std::remove_if(mpPlayers.begin(), mpPlayers.end(),
+        [&](const MpPlayer &p){
+            return std::find(incomingIds.begin(), incomingIds.end(), p.id) == incomingIds.end();
+        }), mpPlayers.end());
 
     mpBats.clear();
     for (int i = 0; i < hdr.batCount; ++i) {
@@ -1056,26 +1108,37 @@ static void NetPoll() {
                         enet_packet_destroy(event.packet);
                         break;
                     }
+                    if (len < sizeof(JoinRequestPacket)) break;
                     JoinRequestPacket req{};
-                    if (!ReadBytes(data, len, off, &req.name, sizeof(req.name))) break;
+                    SDL_memcpy(&req, data, sizeof(req));
                     MpPlayer p;
-                    p.id = (int)mpPlayers.size();
+                    p.id = FindFreePlayerId();
+                    if (p.id < 0) break;
                     p.name = req.name;
                     p.rect = SDL_FRect{ 120.0f + 30.0f * p.id, 200.0f, 40.0f, 40.0f };
                     p.alive = true;
+                    p.connected = true;
                     mpPlayers.push_back(p);
+                    event.peer->data = reinterpret_cast<void*>((intptr_t)p.id);
 
                     std::vector<Uint8> buf;
                     JoinAcceptHeader hdr{};
                     hdr.type = (Uint8)NetMsg::JoinAccept;
                     hdr.assignedId = (Uint8)p.id;
-                    hdr.count = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+                    hdr.count = 0;
+                    for (const auto &pl : mpPlayers) {
+                        if (pl.connected) hdr.count++;
+                    }
                     WriteBytes(buf, &hdr, sizeof(hdr));
-                    for (int i = 0; i < hdr.count; ++i) {
+                    int sent = 0;
+                    for (const auto &pl : mpPlayers) {
+                        if (!pl.connected) continue;
+                        if (sent >= hdr.count) break;
                         JoinAcceptEntry entry{};
-                        entry.id = (Uint8)mpPlayers[i].id;
-                        SDL_strlcpy(entry.name, mpPlayers[i].name.c_str(), sizeof(entry.name));
+                        entry.id = (Uint8)pl.id;
+                        SDL_strlcpy(entry.name, pl.name.c_str(), sizeof(entry.name));
                         WriteBytes(buf, &entry, sizeof(entry));
+                        sent++;
                     }
                     ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
                     enet_peer_send(event.peer, 0, pkt);
@@ -1098,8 +1161,9 @@ static void NetPoll() {
                     SDL_SetWindowMouseGrab(window, true);
                     SDL_HideCursor();
                 } else if (type == NetMsg::Input && netIsHost) {
+                    if (len < sizeof(InputPacket)) break;
                     InputPacket pkt{};
-                    if (!ReadBytes(data, len, off, &pkt, sizeof(pkt) - 1)) break;
+                    SDL_memcpy(&pkt, data, sizeof(pkt));
                     MpInputState input;
                     input.buttons = pkt.buttons;
                     input.aimX = pkt.aimX;
@@ -1111,8 +1175,9 @@ static void NetPoll() {
                 } else if (type == NetMsg::Snapshot && !netIsHost) {
                     NetHandleSnapshot(data, len);
                 } else if (type == NetMsg::KillNotice) {
+                    if (len < sizeof(KillNoticePacket)) break;
                     KillNoticePacket pkt{};
-                    if (!ReadBytes(data, len, off, &pkt.name, sizeof(pkt.name))) break;
+                    SDL_memcpy(&pkt, data, sizeof(pkt));
                     KillPopup kp;
                     kp.text = std::string(pkt.name) + " killed!";
                     killPopups.push_back(kp);
@@ -1129,6 +1194,11 @@ static void NetPoll() {
                     SDL_ShowCursor();
                     SDL_SetWindowMouseGrab(window, false);
                     SDL_StartTextInput(window);
+                }
+                if (netIsHost) {
+                    int id = (int)(intptr_t)event.peer->data;
+                    mpPlayers.erase(std::remove_if(mpPlayers.begin(), mpPlayers.end(),
+                        [&](const MpPlayer &p){ return p.id == id; }), mpPlayers.end());
                 }
                 break;
             default:
@@ -1365,6 +1435,16 @@ static void MpUpdateHost(float dt) {
 }
 
 static void MpUpdateClient(float dt) {
+    const float lerpSpeed = 8.0f;
+    for (auto &p : mpPlayers) {
+        if (p.hasTarget) {
+            float t = SDL_min(1.0f, dt * lerpSpeed);
+            p.rect.x += (p.targetRect.x - p.rect.x) * t;
+            p.rect.y += (p.targetRect.y - p.rect.y) * t;
+            p.vel.x += (p.targetVel.x - p.vel.x) * t;
+            p.vel.y += (p.targetVel.y - p.vel.y) * t;
+        }
+    }
     for (auto &kp : killPopups) kp.timer += dt;
     killPopups.erase(std::remove_if(killPopups.begin(), killPopups.end(),
         [](const KillPopup &k){ return k.timer >= k.lifetime; }), killPopups.end());
