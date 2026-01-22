@@ -294,6 +294,7 @@ static bool netConnected = false;
 static std::vector<MpPlayer> mpPlayers;
 static std::vector<MpProjectile> mpProjectiles;
 static std::vector<Bat> mpBats;
+static std::vector<SDL_FPoint> mpBatTargets;
 static std::array<MpInputState, kMpMaxPlayers> mpInputs;
 static std::array<Uint8, kMpMaxPlayers> mpPrevShoot;
 static int mpLocalId = -1;
@@ -1052,19 +1053,33 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
             return std::find(incomingIds.begin(), incomingIds.end(), p.id) == incomingIds.end();
         }), mpPlayers.end());
 
-    mpBats.clear();
+    if (mpBats.size() != hdr.batCount) {
+        mpBats.clear();
+        mpBatTargets.clear();
+        mpBats.reserve(hdr.batCount);
+        mpBatTargets.reserve(hdr.batCount);
+        for (int i = 0; i < hdr.batCount; ++i) {
+            mpBats.emplace_back(0.0f, 0.0f, 0.0f);
+            mpBatTargets.push_back(SDL_FPoint{0.0f, 0.0f});
+        }
+    }
     for (int i = 0; i < hdr.batCount; ++i) {
-        Bat b(0.0f, 0.0f, 0.0f);
+        Bat &b = mpBats[i];
         Uint8 state = 0, frame = 0, alive = 0;
-        if (!ReadValue(data, len, off, b.pos.x)) return;
-        if (!ReadValue(data, len, off, b.pos.y)) return;
+        float bx = 0.0f, by = 0.0f;
+        if (!ReadValue(data, len, off, bx)) return;
+        if (!ReadValue(data, len, off, by)) return;
         if (!ReadValue(data, len, off, state)) return;
         if (!ReadValue(data, len, off, frame)) return;
         if (!ReadValue(data, len, off, alive)) return;
+        mpBatTargets[i] = SDL_FPoint{bx, by};
+        if (b.pos.x == 0.0f && b.pos.y == 0.0f) {
+            b.pos.x = bx;
+            b.pos.y = by;
+        }
         b.state = (BatState)state;
         b.frame = frame;
         b.alive = alive != 0;
-        mpBats.push_back(b);
     }
 
     mpProjectiles.clear();
@@ -1143,18 +1158,24 @@ static void NetPoll() {
                     ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
                     enet_peer_send(event.peer, 0, pkt);
                 } else if (type == NetMsg::JoinAccept && !netIsHost) {
+                    if (len < sizeof(JoinAcceptHeader)) break;
                     JoinAcceptHeader hdr{};
-                    if (!ReadBytes(data, len, off, &hdr, sizeof(hdr))) break;
+                    SDL_memcpy(&hdr, data, sizeof(hdr));
+                    size_t entryOff = sizeof(hdr);
                     mpLocalId = hdr.assignedId;
                     mpPlayers.clear();
                     for (int i = 0; i < hdr.count; ++i) {
+                        if (entryOff + sizeof(JoinAcceptEntry) > len) break;
                         JoinAcceptEntry entry{};
-                        if (!ReadBytes(data, len, off, &entry, sizeof(entry))) break;
+                        SDL_memcpy(&entry, data + entryOff, sizeof(entry));
+                        entryOff += sizeof(entry);
                         MpPlayer p;
                         p.id = entry.id;
                         p.name = entry.name;
                         p.rect = SDL_FRect{ 120.0f + 30.0f * entry.id, 200.0f, 40.0f, 40.0f };
+                        p.targetRect = p.rect;
                         p.alive = true;
+                        p.connected = true;
                         mpPlayers.push_back(p);
                     }
                     gameState = GameState::MultiplayerPlaying;
@@ -1444,6 +1465,11 @@ static void MpUpdateClient(float dt) {
             p.vel.x += (p.targetVel.x - p.vel.x) * t;
             p.vel.y += (p.targetVel.y - p.vel.y) * t;
         }
+    }
+    for (size_t i = 0; i < mpBats.size() && i < mpBatTargets.size(); ++i) {
+        float t = SDL_min(1.0f, dt * lerpSpeed);
+        mpBats[i].pos.x += (mpBatTargets[i].x - mpBats[i].pos.x) * t;
+        mpBats[i].pos.y += (mpBatTargets[i].y - mpBats[i].pos.y) * t;
     }
     for (auto &kp : killPopups) kp.timer += dt;
     killPopups.erase(std::remove_if(killPopups.begin(), killPopups.end(),
