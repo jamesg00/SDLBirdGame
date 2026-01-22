@@ -168,6 +168,50 @@ enum class NetMsg : Uint8 {
     MatchOver = 6
 };
 
+#pragma pack(push, 1)
+struct JoinRequestPacket {
+    Uint8 type;
+    char name[kMpNameLen];
+};
+
+struct JoinAcceptHeader {
+    Uint8 type;
+    Uint8 assignedId;
+    Uint8 count;
+};
+
+struct JoinAcceptEntry {
+    Uint8 id;
+    char name[kMpNameLen];
+};
+
+struct InputPacket {
+    Uint8 type;
+    Uint8 id;
+    Uint8 buttons;
+    float aimX;
+    float aimY;
+    Uint8 shoot;
+};
+
+struct SnapshotHeader {
+    Uint8 type;
+    float matchTimer;
+    Uint8 playerCount;
+    Uint8 batCount;
+    Uint16 projCount;
+};
+
+struct KillNoticePacket {
+    Uint8 type;
+    char name[kMpNameLen];
+};
+
+struct MatchOverPacket {
+    Uint8 type;
+};
+#pragma pack(pop)
+
 struct MpInputState {
     Uint8 buttons = 0;
     float aimX = 0.0f;
@@ -822,45 +866,42 @@ static void SaveSavedIps() {
 
 static void NetSendJoinRequest() {
     if (!netHost || !netServer) return;
-    std::vector<Uint8> buf;
-    WriteValue(buf, (Uint8)NetMsg::JoinRequest);
-    char nameBuf[kMpNameLen] = {};
-    SDL_strlcpy(nameBuf, mpUserName.c_str(), sizeof(nameBuf));
-    WriteBytes(buf, nameBuf, sizeof(nameBuf));
-    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
-    enet_peer_send(netServer, 0, pkt);
+    JoinRequestPacket pkt{};
+    pkt.type = (Uint8)NetMsg::JoinRequest;
+    SDL_strlcpy(pkt.name, mpUserName.c_str(), sizeof(pkt.name));
+    ENetPacket *packet = enet_packet_create(&pkt, sizeof(pkt), ENET_PACKET_FLAG_RELIABLE);
+    enet_peer_send(netServer, 0, packet);
 }
 
 static void NetSendInput(int playerId, const MpInputState &input) {
     if (!netHost || (!netIsHost && !netServer)) return;
-    std::vector<Uint8> buf;
-    WriteValue(buf, (Uint8)NetMsg::Input);
-    WriteValue(buf, (Uint8)playerId);
-    WriteValue(buf, input.buttons);
-    WriteValue(buf, input.aimX);
-    WriteValue(buf, input.aimY);
-    WriteValue(buf, input.shoot);
-    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), 0);
+    InputPacket pkt{};
+    pkt.type = (Uint8)NetMsg::Input;
+    pkt.id = (Uint8)playerId;
+    pkt.buttons = input.buttons;
+    pkt.aimX = input.aimX;
+    pkt.aimY = input.aimY;
+    pkt.shoot = input.shoot;
+    ENetPacket *packet = enet_packet_create(&pkt, sizeof(pkt), 0);
     if (netIsHost) {
-        enet_host_broadcast(netHost, 0, pkt);
+        enet_host_broadcast(netHost, 0, packet);
     } else {
-        enet_peer_send(netServer, 0, pkt);
+        enet_peer_send(netServer, 0, packet);
     }
 }
 
 static void NetSendSnapshot() {
     if (!netIsHost || !netHost) return;
     std::vector<Uint8> buf;
-    WriteValue(buf, (Uint8)NetMsg::Snapshot);
-    WriteValue(buf, mpMatchTimer);
-    Uint8 playerCount = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
-    Uint8 batCount = (Uint8)SDL_min((int)mpBats.size(), kMpMaxBats);
-    Uint16 projCount = (Uint16)SDL_min((int)mpProjectiles.size(), kMpMaxProjectiles);
-    WriteValue(buf, playerCount);
-    WriteValue(buf, batCount);
-    WriteValue(buf, projCount);
+    SnapshotHeader hdr{};
+    hdr.type = (Uint8)NetMsg::Snapshot;
+    hdr.matchTimer = mpMatchTimer;
+    hdr.playerCount = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+    hdr.batCount = (Uint8)SDL_min((int)mpBats.size(), kMpMaxBats);
+    hdr.projCount = (Uint16)SDL_min((int)mpProjectiles.size(), kMpMaxProjectiles);
+    WriteBytes(buf, &hdr, sizeof(hdr));
 
-    for (int i = 0; i < playerCount; ++i) {
+    for (int i = 0; i < hdr.playerCount; ++i) {
         const auto &p = mpPlayers[i];
         WriteValue(buf, (Uint8)p.id);
         char nameBuf[kMpNameLen] = {};
@@ -880,7 +921,7 @@ static void NetSendSnapshot() {
         WriteValue(buf, p.respawnTimer);
     }
 
-    for (int i = 0; i < batCount; ++i) {
+    for (int i = 0; i < hdr.batCount; ++i) {
         const auto &b = mpBats[i];
         WriteValue(buf, b.pos.x);
         WriteValue(buf, b.pos.y);
@@ -889,7 +930,7 @@ static void NetSendSnapshot() {
         WriteValue(buf, (Uint8)(b.alive ? 1 : 0));
     }
 
-    for (int i = 0; i < projCount; ++i) {
+    for (int i = 0; i < hdr.projCount; ++i) {
         const auto &p = mpProjectiles[i];
         WriteValue(buf, p.pos.x);
         WriteValue(buf, p.pos.y);
@@ -904,37 +945,29 @@ static void NetSendSnapshot() {
 
 static void NetSendKillPopup(const std::string &who) {
     if (!netIsHost || !netHost) return;
-    std::vector<Uint8> buf;
-    WriteValue(buf, (Uint8)NetMsg::KillNotice);
-    char nameBuf[kMpNameLen] = {};
-    SDL_strlcpy(nameBuf, who.c_str(), sizeof(nameBuf));
-    WriteBytes(buf, nameBuf, sizeof(nameBuf));
-    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
-    enet_host_broadcast(netHost, 0, pkt);
+    KillNoticePacket pkt{};
+    pkt.type = (Uint8)NetMsg::KillNotice;
+    SDL_strlcpy(pkt.name, who.c_str(), sizeof(pkt.name));
+    ENetPacket *packet = enet_packet_create(&pkt, sizeof(pkt), ENET_PACKET_FLAG_RELIABLE);
+    enet_host_broadcast(netHost, 0, packet);
 }
 
 static void NetSendMatchOver() {
     if (!netIsHost || !netHost) return;
-    std::vector<Uint8> buf;
-    WriteValue(buf, (Uint8)NetMsg::MatchOver);
-    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
-    enet_host_broadcast(netHost, 0, pkt);
+    MatchOverPacket pkt{};
+    pkt.type = (Uint8)NetMsg::MatchOver;
+    ENetPacket *packet = enet_packet_create(&pkt, sizeof(pkt), ENET_PACKET_FLAG_RELIABLE);
+    enet_host_broadcast(netHost, 0, packet);
 }
 
 static void NetHandleSnapshot(const Uint8 *data, size_t len) {
     size_t off = 0;
-    float matchTime = 0.0f;
-    Uint8 playerCount = 0;
-    Uint8 batCount = 0;
-    Uint16 projCount = 0;
-    if (!ReadValue(data, len, off, matchTime)) return;
-    if (!ReadValue(data, len, off, playerCount)) return;
-    if (!ReadValue(data, len, off, batCount)) return;
-    if (!ReadValue(data, len, off, projCount)) return;
-    mpMatchTimer = matchTime;
+    SnapshotHeader hdr{};
+    if (!ReadBytes(data, len, off, &hdr, sizeof(hdr))) return;
+    mpMatchTimer = hdr.matchTimer;
 
     mpPlayers.clear();
-    for (int i = 0; i < playerCount; ++i) {
+    for (int i = 0; i < hdr.playerCount; ++i) {
         MpPlayer p;
         Uint8 id = 0;
         Uint8 health = 0, alive = 0, facing = 0, inv = 0;
@@ -968,7 +1001,7 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
     }
 
     mpBats.clear();
-    for (int i = 0; i < batCount; ++i) {
+    for (int i = 0; i < hdr.batCount; ++i) {
         Bat b(0.0f, 0.0f, 0.0f);
         Uint8 state = 0, frame = 0, alive = 0;
         if (!ReadValue(data, len, off, b.pos.x)) return;
@@ -983,7 +1016,7 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
     }
 
     mpProjectiles.clear();
-    for (int i = 0; i < projCount; ++i) {
+    for (int i = 0; i < hdr.projCount; ++i) {
         float x = 0.0f, y = 0.0f, angle = 0.0f;
         Uint8 frame = 0, alive = 0;
         if (!ReadValue(data, len, off, x)) return;
@@ -1023,43 +1056,41 @@ static void NetPoll() {
                         enet_packet_destroy(event.packet);
                         break;
                     }
-                    char nameBuf[kMpNameLen] = {};
-                    if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                    JoinRequestPacket req{};
+                    if (!ReadBytes(data, len, off, &req.name, sizeof(req.name))) break;
                     MpPlayer p;
                     p.id = (int)mpPlayers.size();
-                    p.name = nameBuf;
+                    p.name = req.name;
                     p.rect = SDL_FRect{ 120.0f + 30.0f * p.id, 200.0f, 40.0f, 40.0f };
                     p.alive = true;
                     mpPlayers.push_back(p);
 
                     std::vector<Uint8> buf;
-                    WriteValue(buf, (Uint8)NetMsg::JoinAccept);
-                    WriteValue(buf, (Uint8)p.id);
-                    Uint8 count = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
-                    WriteValue(buf, count);
-                    for (int i = 0; i < count; ++i) {
-                        WriteValue(buf, (Uint8)mpPlayers[i].id);
-                        char outName[kMpNameLen] = {};
-                        SDL_strlcpy(outName, mpPlayers[i].name.c_str(), sizeof(outName));
-                        WriteBytes(buf, outName, sizeof(outName));
+                    JoinAcceptHeader hdr{};
+                    hdr.type = (Uint8)NetMsg::JoinAccept;
+                    hdr.assignedId = (Uint8)p.id;
+                    hdr.count = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+                    WriteBytes(buf, &hdr, sizeof(hdr));
+                    for (int i = 0; i < hdr.count; ++i) {
+                        JoinAcceptEntry entry{};
+                        entry.id = (Uint8)mpPlayers[i].id;
+                        SDL_strlcpy(entry.name, mpPlayers[i].name.c_str(), sizeof(entry.name));
+                        WriteBytes(buf, &entry, sizeof(entry));
                     }
                     ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
                     enet_peer_send(event.peer, 0, pkt);
                 } else if (type == NetMsg::JoinAccept && !netIsHost) {
-                    Uint8 assigned = 0, count = 0;
-                    if (!ReadValue(data, len, off, assigned)) break;
-                    if (!ReadValue(data, len, off, count)) break;
-                    mpLocalId = assigned;
+                    JoinAcceptHeader hdr{};
+                    if (!ReadBytes(data, len, off, &hdr, sizeof(hdr))) break;
+                    mpLocalId = hdr.assignedId;
                     mpPlayers.clear();
-                    for (int i = 0; i < count; ++i) {
-                        Uint8 id = 0;
-                        char nameBuf[kMpNameLen] = {};
-                        if (!ReadValue(data, len, off, id)) break;
-                        if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                    for (int i = 0; i < hdr.count; ++i) {
+                        JoinAcceptEntry entry{};
+                        if (!ReadBytes(data, len, off, &entry, sizeof(entry))) break;
                         MpPlayer p;
-                        p.id = id;
-                        p.name = nameBuf;
-                        p.rect = SDL_FRect{ 120.0f + 30.0f * id, 200.0f, 40.0f, 40.0f };
+                        p.id = entry.id;
+                        p.name = entry.name;
+                        p.rect = SDL_FRect{ 120.0f + 30.0f * entry.id, 200.0f, 40.0f, 40.0f };
                         p.alive = true;
                         mpPlayers.push_back(p);
                     }
@@ -1067,23 +1098,23 @@ static void NetPoll() {
                     SDL_SetWindowMouseGrab(window, true);
                     SDL_HideCursor();
                 } else if (type == NetMsg::Input && netIsHost) {
-                    Uint8 id = 0;
+                    InputPacket pkt{};
+                    if (!ReadBytes(data, len, off, &pkt, sizeof(pkt) - 1)) break;
                     MpInputState input;
-                    if (!ReadValue(data, len, off, id)) break;
-                    if (!ReadValue(data, len, off, input.buttons)) break;
-                    if (!ReadValue(data, len, off, input.aimX)) break;
-                    if (!ReadValue(data, len, off, input.aimY)) break;
-                    if (!ReadValue(data, len, off, input.shoot)) break;
-                    if (id < mpInputs.size()) {
-                        mpInputs[id] = input;
+                    input.buttons = pkt.buttons;
+                    input.aimX = pkt.aimX;
+                    input.aimY = pkt.aimY;
+                    input.shoot = pkt.shoot;
+                    if (pkt.id < mpInputs.size()) {
+                        mpInputs[pkt.id] = input;
                     }
                 } else if (type == NetMsg::Snapshot && !netIsHost) {
-                    NetHandleSnapshot(data + 1, len - 1);
+                    NetHandleSnapshot(data, len);
                 } else if (type == NetMsg::KillNotice) {
-                    char nameBuf[kMpNameLen] = {};
-                    if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                    KillNoticePacket pkt{};
+                    if (!ReadBytes(data, len, off, &pkt.name, sizeof(pkt.name))) break;
                     KillPopup kp;
-                    kp.text = std::string(nameBuf) + " killed!";
+                    kp.text = std::string(pkt.name) + " killed!";
                     killPopups.push_back(kp);
                 } else if (type == NetMsg::MatchOver) {
                     mpMatchOver = true;
