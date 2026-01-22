@@ -675,6 +675,50 @@ static void RenderLabelScaled(const std::string &text, float x, float y, float s
     if (texMain) SDL_DestroyTexture(texMain);
 }
 
+static void RenderLabelColoredScaled(const std::string &text, float x, float y, float scale, SDL_Color col) {
+    if (!font || text.empty()) return;
+    SDL_Color shadow{0, 0, 0, 160};
+
+    auto makeTex = [&](SDL_Color c) -> SDL_Texture* {
+        SDL_Surface *surf = TTF_RenderText_Blended(font, text.c_str(), 0, c);
+        if (!surf) return nullptr;
+        SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+        SDL_DestroySurface(surf);
+        return tex;
+    };
+
+    SDL_Texture *texShadow = makeTex(shadow);
+    SDL_Texture *texMain = makeTex(col);
+    float w = 0.0f, h = 0.0f;
+    if (texShadow && SDL_GetTextureSize(texShadow, &w, &h)) {
+        SDL_FRect dst1{ x + 2.0f, y + 2.0f, w * scale, h * scale };
+        SDL_FRect dst2{ x + 4.0f, y + 4.0f, w * scale, h * scale };
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst1);
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst2);
+    }
+    if (texMain && SDL_GetTextureSize(texMain, &w, &h)) {
+        SDL_FRect dst{ x, y, w * scale, h * scale };
+        SDL_RenderTexture(renderer, texMain, nullptr, &dst);
+    }
+    if (texShadow) SDL_DestroyTexture(texShadow);
+    if (texMain) SDL_DestroyTexture(texMain);
+}
+
+static SDL_FRect GetBirdBatHitbox(const SDL_FRect &rect) {
+    float padX = 6.0f;
+    float padTop = 4.0f;
+    float padBottom = 8.0f;
+    SDL_FRect hb{
+        rect.x + padX,
+        rect.y + padTop,
+        rect.w - padX * 2.0f,
+        rect.h - padTop - padBottom
+    };
+    if (hb.w < 1.0f) hb.w = 1.0f;
+    if (hb.h < 1.0f) hb.h = 1.0f;
+    return hb;
+}
+
 static void RenderCachedTextShadowed(const CachedText &ct, float x, float y, float alpha = 255.0f) {
     if (!ct.tex) return;
     Uint8 a = (Uint8)SDL_roundf(alpha);
@@ -1442,7 +1486,7 @@ static void MpUpdateHost(float dt) {
         if (!b.alive || b.state != BatState::Moving) continue;
         for (auto &p : mpPlayers) {
             if (!p.alive) continue;
-            if (AABBOverlap(p.rect, b.Bounds())) {
+            if (AABBOverlap(GetBirdBatHitbox(p.rect), b.Bounds())) {
                 b.Kill();
                 MpDamagePlayer(p, -1);
                 break;
@@ -1514,6 +1558,27 @@ static void MpRenderHUD() {
         RenderLabel(line, x, y);
         y += 18.0f;
     }
+}
+
+static void MpRenderPing() {
+    float pingMs = 0.0f;
+    if (netIsHost) {
+        pingMs = 0.0f;
+    } else if (netServer) {
+        pingMs = (float)netServer->roundTripTime;
+    }
+
+    SDL_Color col{0, 220, 80, 255};
+    if (pingMs > 160.0f) col = SDL_Color{220, 60, 60, 255};
+    else if (pingMs > 80.0f) col = SDL_Color{230, 190, 60, 255};
+
+    std::string label = netIsHost ? "Ping: host" : ("Ping: " + std::to_string((int)pingMs) + "ms");
+    int w = 0, h = 0;
+    if (!TTF_GetStringSize(font, label.c_str(), label.size(), &w, &h)) return;
+    float scale = 0.7f;
+    float x = (float)kWinW - (float)w * scale - 16.0f;
+    float y = (float)kWinH - (float)h * scale - 16.0f;
+    RenderLabelColoredScaled(label, x, y, scale, col);
 }
 
 static void MpRenderMatchOver() {
@@ -2767,7 +2832,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             SDL_FRect batBox = b.Bounds();
             bool batOnScreen = AABBOverlap(batBox, screenRect);
             if (!batOnScreen) continue;
-            if (AABBOverlap(playerBox, batBox)) {
+            if (AABBOverlap(GetBirdBatHitbox(playerBox), batBox)) {
                 if (shieldActive) {
                     gSoundManager.PlaySound("bat_hit");
                     b.Kill();
@@ -3186,6 +3251,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     if (gameState == GameState::MultiplayerPlaying || gameState == GameState::MultiplayerOver) {
         MpRenderHUD();
+        MpRenderPing();
         if (gameState == GameState::MultiplayerOver) {
             MpRenderMatchOver();
         }
