@@ -10,6 +10,14 @@
 #include <random>
 #include <string>
 #include <cmath>
+#include <array>
+#include <deque>
+#include <fstream>
+#include <enet/enet.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 #include "core/parallax.h"
 #include "core/utils.h"
 #include "core/projectile.h"
@@ -108,6 +116,7 @@ static CachedText hudScoreText;
 static CachedText menuTitleText;
 static CachedText menuStartText;
 static CachedText menuOptionsText;
+static CachedText menuMultiplayerText;
 static CachedText menuQuitText;
 static CachedText optionsStateText;
 static CachedText overTitleText;
@@ -138,6 +147,125 @@ struct BeatScorePopup {
 static std::vector<BeatScorePopup> beatScorePopups;
 static bool beatScoreAnnounced = false;
 static GameRecord record;
+
+static constexpr int kMpMaxPlayers = 10;
+static constexpr int kMpMaxBats = 96;
+static constexpr int kMpMaxProjectiles = 192;
+static constexpr float kMpMatchDuration = 300.0f;
+static constexpr int kMpPort = 22100;
+static constexpr int kMpNameLen = 16;
+static constexpr Uint8 kMpBtnLeft = 1 << 0;
+static constexpr Uint8 kMpBtnRight = 1 << 1;
+static constexpr Uint8 kMpBtnJump = 1 << 2;
+static constexpr Uint8 kMpBtnDown = 1 << 3;
+
+enum class NetMsg : Uint8 {
+    JoinRequest = 1,
+    JoinAccept = 2,
+    Input = 3,
+    Snapshot = 4,
+    KillNotice = 5,
+    MatchOver = 6
+};
+
+struct MpInputState {
+    Uint8 buttons = 0;
+    float aimX = 0.0f;
+    float aimY = 0.0f;
+    Uint8 shoot = 0;
+};
+
+struct MpPlayer {
+    int id = -1;
+    std::string name;
+    SDL_FRect rect{0,0,40,40};
+    SDL_FPoint vel{0.0f, 0.0f};
+    bool alive = false;
+    bool facingRight = true;
+    bool wasJumpDown = false;
+    int health = 3;
+    int kills = 0;
+    int deaths = 0;
+    int score = 0;
+    bool invincible = false;
+    float invincibleTimer = 0.0f;
+    float respawnTimer = 0.0f;
+};
+
+struct MpProjectile {
+    SDL_FPoint pos;
+    SDL_FPoint vel;
+    float angle = 0.0f;
+    float timer = 0.0f;
+    int frame = 0;
+    bool alive = true;
+    int ownerId = -1;
+
+    MpProjectile(float x, float y, float vx, float vy, float ang, int owner)
+        : pos{x, y}, vel{vx, vy}, angle{ang}, ownerId(owner) {}
+
+    void Update(float dt) {
+        if (!alive) return;
+        pos.x += vel.x * dt;
+        pos.y += vel.y * dt;
+        timer += dt;
+        const float frameTime = 0.03f;
+        while (timer >= frameTime) {
+            timer -= frameTime;
+            frame = (frame + 1) % 30;
+        }
+        if (pos.x < -100 || pos.x > kWinW + 100 || pos.y < -100 || pos.y > kWinH + 100) {
+            alive = false;
+        }
+    }
+
+    void Render(SDL_Renderer *r) const {
+        if (!alive || !projectileFrames[frame]) return;
+        float w = 128.0f, h = 128.0f;
+        SDL_FRect dst{pos.x - w * 0.5f, pos.y - h * 0.5f, w, h};
+        SDL_RenderTextureRotated(r, projectileFrames[frame], nullptr, &dst, angle, nullptr, SDL_FLIP_NONE);
+    }
+
+    SDL_FRect Bounds() const {
+        return SDL_FRect{ pos.x - 10.0f, pos.y - 10.0f, 20.0f, 20.0f };
+    }
+};
+
+struct KillPopup {
+    std::string text;
+    float timer = 0.0f;
+    float lifetime = 2.0f;
+};
+static std::vector<KillPopup> killPopups;
+
+static ENetHost *netHost = nullptr;
+static ENetPeer *netServer = nullptr;
+static bool netIsHost = false;
+static bool netConnected = false;
+
+static std::vector<MpPlayer> mpPlayers;
+static std::vector<MpProjectile> mpProjectiles;
+static std::vector<Bat> mpBats;
+static std::array<MpInputState, kMpMaxPlayers> mpInputs;
+static std::array<Uint8, kMpMaxPlayers> mpPrevShoot;
+static int mpLocalId = -1;
+static float mpMatchTimer = 0.0f;
+static bool mpMatchOver = false;
+static std::string mpUserName = "Player";
+static std::string mpHostIp = "127.0.0.1";
+static std::string mpLocalIp = "Unknown";
+static bool mpNameActive = false;
+static bool mpIpActive = false;
+static std::deque<std::string> mpSavedIps;
+static float mpSnapshotTimer = 0.0f;
+static float mpBatSpawnTimer = 0.0f;
+static float mpBatSpawnInterval = 2.5f;
+static SDL_FRect mpHostBtn{0,0,0,0};
+static SDL_FRect mpJoinBtn{0,0,0,0};
+static SDL_FRect mpBackBtn{0,0,0,0};
+static SDL_FRect mpNameBox{0,0,0,0};
+static SDL_FRect mpIpBox{0,0,0,0};
+static SDL_FRect mpSavedBoxes[5];
 
 struct WaveTextCache {
     std::string text;
@@ -468,6 +596,36 @@ static void RenderLabel(const std::string &text, float x, float y) {
     if (texMain) SDL_DestroyTexture(texMain);
 }
 
+static void RenderLabelScaled(const std::string &text, float x, float y, float scale) {
+    if (!font || text.empty()) return;
+    SDL_Color white{255, 255, 255, 255};
+    SDL_Color shadow{0, 0, 0, 160};
+
+    auto makeTex = [&](SDL_Color col) -> SDL_Texture* {
+        SDL_Surface *surf = TTF_RenderText_Blended(font, text.c_str(), 0, col);
+        if (!surf) return nullptr;
+        SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+        SDL_DestroySurface(surf);
+        return tex;
+    };
+
+    SDL_Texture *texShadow = makeTex(shadow);
+    SDL_Texture *texMain = makeTex(white);
+    float w = 0.0f, h = 0.0f;
+    if (texShadow && SDL_GetTextureSize(texShadow, &w, &h)) {
+        SDL_FRect dst1{ x + 2.0f, y + 2.0f, w * scale, h * scale };
+        SDL_FRect dst2{ x + 4.0f, y + 4.0f, w * scale, h * scale };
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst1);
+        SDL_RenderTexture(renderer, texShadow, nullptr, &dst2);
+    }
+    if (texMain && SDL_GetTextureSize(texMain, &w, &h)) {
+        SDL_FRect dst{ x, y, w * scale, h * scale };
+        SDL_RenderTexture(renderer, texMain, nullptr, &dst);
+    }
+    if (texShadow) SDL_DestroyTexture(texShadow);
+    if (texMain) SDL_DestroyTexture(texMain);
+}
+
 static void RenderCachedTextShadowed(const CachedText &ct, float x, float y, float alpha = 255.0f) {
     if (!ct.tex) return;
     Uint8 a = (Uint8)SDL_roundf(alpha);
@@ -494,6 +652,776 @@ static void RenderCachedTextShadowedScaled(const CachedText &ct, float x, float 
     SDL_SetTextureAlphaMod(ct.tex, a);
     SDL_FRect dst{ x, y, w, h };
     SDL_RenderTexture(renderer, ct.tex, nullptr, &dst);
+}
+
+template <typename T>
+static void WriteValue(std::vector<Uint8> &buf, const T &value) {
+    const Uint8 *ptr = reinterpret_cast<const Uint8 *>(&value);
+    buf.insert(buf.end(), ptr, ptr + sizeof(T));
+}
+
+static void WriteBytes(std::vector<Uint8> &buf, const void *data, size_t size) {
+    const Uint8 *ptr = reinterpret_cast<const Uint8 *>(data);
+    buf.insert(buf.end(), ptr, ptr + size);
+}
+
+template <typename T>
+static bool ReadValue(const Uint8 *data, size_t len, size_t &offset, T &out) {
+    if (offset + sizeof(T) > len) return false;
+    SDL_memcpy(&out, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+static bool ReadBytes(const Uint8 *data, size_t len, size_t &offset, void *out, size_t size) {
+    if (offset + size > len) return false;
+    SDL_memcpy(out, data + offset, size);
+    offset += size;
+    return true;
+}
+
+static bool InitNet() {
+    if (enet_initialize() != 0) {
+        SDL_Log("ENet init failed");
+        return false;
+    }
+    return true;
+}
+
+static std::string GetLocalIp() {
+#ifdef _WIN32
+    char host[256] = {};
+    if (gethostname(host, sizeof(host)) != 0) return "Unknown";
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return "Unknown";
+    std::string out = "Unknown";
+    for (addrinfo *p = res; p; p = p->ai_next) {
+        sockaddr_in *addr = (sockaddr_in *)p->ai_addr;
+        const char *ip = inet_ntoa(addr->sin_addr);
+        if (ip) {
+            std::string s = ip;
+            if (s.rfind("127.", 0) != 0) { out = s; break; }
+            out = s;
+        }
+    }
+    freeaddrinfo(res);
+    return out;
+#else
+    return "Unknown";
+#endif
+}
+
+static void ShutdownNet() {
+    if (netServer) {
+        enet_peer_disconnect(netServer, 0);
+        netServer = nullptr;
+    }
+    if (netHost) {
+        enet_host_destroy(netHost);
+        netHost = nullptr;
+    }
+    netConnected = false;
+    netIsHost = false;
+    enet_deinitialize();
+}
+
+static void NetResetSession() {
+    mpPlayers.clear();
+    mpProjectiles.clear();
+    mpBats.clear();
+    for (auto &in : mpInputs) in = MpInputState{};
+    for (auto &s : mpPrevShoot) s = 0;
+    mpLocalId = -1;
+    mpMatchTimer = 0.0f;
+    mpBatSpawnTimer = 0.0f;
+    mpBatSpawnInterval = 2.5f;
+    mpMatchOver = false;
+    killPopups.clear();
+}
+
+static bool NetStartHost() {
+    NetResetSession();
+    ENetAddress address;
+    address.host = ENET_HOST_ANY;
+    address.port = kMpPort;
+    netHost = enet_host_create(&address, kMpMaxPlayers, 2, 0, 0);
+    if (!netHost) {
+        SDL_Log("Failed to create ENet host");
+        return false;
+    }
+    netIsHost = true;
+    netConnected = true;
+    mpLocalId = 0;
+    MpPlayer hostPlayer;
+    hostPlayer.id = 0;
+    hostPlayer.name = mpUserName;
+    hostPlayer.rect = SDL_FRect{ kWinW * 0.5f - 20.0f, kWinH * 0.5f - 20.0f, 40.0f, 40.0f };
+    hostPlayer.alive = true;
+    mpPlayers.push_back(hostPlayer);
+    return true;
+}
+
+static bool NetStartClient(const std::string &ip) {
+    NetResetSession();
+    ENetAddress address;
+    if (enet_address_set_host(&address, ip.c_str()) != 0) {
+        SDL_Log("Invalid host: %s", ip.c_str());
+        return false;
+    }
+    address.port = kMpPort;
+    netHost = enet_host_create(nullptr, 1, 2, 0, 0);
+    if (!netHost) {
+        SDL_Log("Failed to create ENet client");
+        return false;
+    }
+    netServer = enet_host_connect(netHost, &address, 2, 0);
+    if (!netServer) {
+        SDL_Log("Failed to connect");
+        return false;
+    }
+    netIsHost = false;
+    netConnected = false;
+    return true;
+}
+
+static void NetDisconnect() {
+    if (netServer) {
+        enet_peer_disconnect(netServer, 0);
+        netServer = nullptr;
+    }
+    if (netHost) {
+        enet_host_destroy(netHost);
+        netHost = nullptr;
+    }
+    netConnected = false;
+    netIsHost = false;
+}
+
+
+static void LoadSavedIps() {
+    mpSavedIps.clear();
+    std::ifstream in("records/ips.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        mpSavedIps.push_back(line);
+        if (mpSavedIps.size() >= 5) break;
+    }
+}
+
+static void SaveSavedIps() {
+    std::ofstream out("records/ips.txt", std::ios::trunc);
+    if (!out) return;
+    for (const auto &ip : mpSavedIps) {
+        out << ip << "\n";
+    }
+}
+
+static void NetSendJoinRequest() {
+    if (!netHost || !netServer) return;
+    std::vector<Uint8> buf;
+    WriteValue(buf, (Uint8)NetMsg::JoinRequest);
+    char nameBuf[kMpNameLen] = {};
+    SDL_strlcpy(nameBuf, mpUserName.c_str(), sizeof(nameBuf));
+    WriteBytes(buf, nameBuf, sizeof(nameBuf));
+    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
+    enet_peer_send(netServer, 0, pkt);
+}
+
+static void NetSendInput(int playerId, const MpInputState &input) {
+    if (!netHost || (!netIsHost && !netServer)) return;
+    std::vector<Uint8> buf;
+    WriteValue(buf, (Uint8)NetMsg::Input);
+    WriteValue(buf, (Uint8)playerId);
+    WriteValue(buf, input.buttons);
+    WriteValue(buf, input.aimX);
+    WriteValue(buf, input.aimY);
+    WriteValue(buf, input.shoot);
+    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), 0);
+    if (netIsHost) {
+        enet_host_broadcast(netHost, 0, pkt);
+    } else {
+        enet_peer_send(netServer, 0, pkt);
+    }
+}
+
+static void NetSendSnapshot() {
+    if (!netIsHost || !netHost) return;
+    std::vector<Uint8> buf;
+    WriteValue(buf, (Uint8)NetMsg::Snapshot);
+    WriteValue(buf, mpMatchTimer);
+    Uint8 playerCount = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+    Uint8 batCount = (Uint8)SDL_min((int)mpBats.size(), kMpMaxBats);
+    Uint16 projCount = (Uint16)SDL_min((int)mpProjectiles.size(), kMpMaxProjectiles);
+    WriteValue(buf, playerCount);
+    WriteValue(buf, batCount);
+    WriteValue(buf, projCount);
+
+    for (int i = 0; i < playerCount; ++i) {
+        const auto &p = mpPlayers[i];
+        WriteValue(buf, (Uint8)p.id);
+        char nameBuf[kMpNameLen] = {};
+        SDL_strlcpy(nameBuf, p.name.c_str(), sizeof(nameBuf));
+        WriteBytes(buf, nameBuf, sizeof(nameBuf));
+        WriteValue(buf, p.rect.x);
+        WriteValue(buf, p.rect.y);
+        WriteValue(buf, p.vel.x);
+        WriteValue(buf, p.vel.y);
+        WriteValue(buf, (Uint8)p.health);
+        WriteValue(buf, (Uint8)(p.alive ? 1 : 0));
+        WriteValue(buf, (Uint8)(p.facingRight ? 1 : 0));
+        WriteValue(buf, (Uint16)p.kills);
+        WriteValue(buf, (Uint16)p.deaths);
+        WriteValue(buf, p.score);
+        WriteValue(buf, (Uint8)(p.invincible ? 1 : 0));
+        WriteValue(buf, p.respawnTimer);
+    }
+
+    for (int i = 0; i < batCount; ++i) {
+        const auto &b = mpBats[i];
+        WriteValue(buf, b.pos.x);
+        WriteValue(buf, b.pos.y);
+        WriteValue(buf, (Uint8)b.state);
+        WriteValue(buf, (Uint8)b.frame);
+        WriteValue(buf, (Uint8)(b.alive ? 1 : 0));
+    }
+
+    for (int i = 0; i < projCount; ++i) {
+        const auto &p = mpProjectiles[i];
+        WriteValue(buf, p.pos.x);
+        WriteValue(buf, p.pos.y);
+        WriteValue(buf, p.angle);
+        WriteValue(buf, (Uint8)p.frame);
+        WriteValue(buf, (Uint8)(p.alive ? 1 : 0));
+    }
+
+    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), 0);
+    enet_host_broadcast(netHost, 0, pkt);
+}
+
+static void NetSendKillPopup(const std::string &who) {
+    if (!netIsHost || !netHost) return;
+    std::vector<Uint8> buf;
+    WriteValue(buf, (Uint8)NetMsg::KillNotice);
+    char nameBuf[kMpNameLen] = {};
+    SDL_strlcpy(nameBuf, who.c_str(), sizeof(nameBuf));
+    WriteBytes(buf, nameBuf, sizeof(nameBuf));
+    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
+    enet_host_broadcast(netHost, 0, pkt);
+}
+
+static void NetSendMatchOver() {
+    if (!netIsHost || !netHost) return;
+    std::vector<Uint8> buf;
+    WriteValue(buf, (Uint8)NetMsg::MatchOver);
+    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
+    enet_host_broadcast(netHost, 0, pkt);
+}
+
+static void NetHandleSnapshot(const Uint8 *data, size_t len) {
+    size_t off = 0;
+    float matchTime = 0.0f;
+    Uint8 playerCount = 0;
+    Uint8 batCount = 0;
+    Uint16 projCount = 0;
+    if (!ReadValue(data, len, off, matchTime)) return;
+    if (!ReadValue(data, len, off, playerCount)) return;
+    if (!ReadValue(data, len, off, batCount)) return;
+    if (!ReadValue(data, len, off, projCount)) return;
+    mpMatchTimer = matchTime;
+
+    mpPlayers.clear();
+    for (int i = 0; i < playerCount; ++i) {
+        MpPlayer p;
+        Uint8 id = 0;
+        Uint8 health = 0, alive = 0, facing = 0, inv = 0;
+        Uint16 kills = 0, deaths = 0;
+        if (!ReadValue(data, len, off, id)) return;
+        char nameBuf[kMpNameLen] = {};
+        if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) return;
+        if (!ReadValue(data, len, off, p.rect.x)) return;
+        if (!ReadValue(data, len, off, p.rect.y)) return;
+        if (!ReadValue(data, len, off, p.vel.x)) return;
+        if (!ReadValue(data, len, off, p.vel.y)) return;
+        if (!ReadValue(data, len, off, health)) return;
+        if (!ReadValue(data, len, off, alive)) return;
+        if (!ReadValue(data, len, off, facing)) return;
+        if (!ReadValue(data, len, off, kills)) return;
+        if (!ReadValue(data, len, off, deaths)) return;
+        if (!ReadValue(data, len, off, p.score)) return;
+        if (!ReadValue(data, len, off, inv)) return;
+        if (!ReadValue(data, len, off, p.respawnTimer)) return;
+        p.id = id;
+        p.name = nameBuf;
+        p.health = health;
+        p.alive = alive != 0;
+        p.facingRight = facing != 0;
+        p.kills = kills;
+        p.deaths = deaths;
+        p.invincible = inv != 0;
+        p.rect.w = 40.0f;
+        p.rect.h = 40.0f;
+        mpPlayers.push_back(p);
+    }
+
+    mpBats.clear();
+    for (int i = 0; i < batCount; ++i) {
+        Bat b(0.0f, 0.0f, 0.0f);
+        Uint8 state = 0, frame = 0, alive = 0;
+        if (!ReadValue(data, len, off, b.pos.x)) return;
+        if (!ReadValue(data, len, off, b.pos.y)) return;
+        if (!ReadValue(data, len, off, state)) return;
+        if (!ReadValue(data, len, off, frame)) return;
+        if (!ReadValue(data, len, off, alive)) return;
+        b.state = (BatState)state;
+        b.frame = frame;
+        b.alive = alive != 0;
+        mpBats.push_back(b);
+    }
+
+    mpProjectiles.clear();
+    for (int i = 0; i < projCount; ++i) {
+        float x = 0.0f, y = 0.0f, angle = 0.0f;
+        Uint8 frame = 0, alive = 0;
+        if (!ReadValue(data, len, off, x)) return;
+        if (!ReadValue(data, len, off, y)) return;
+        if (!ReadValue(data, len, off, angle)) return;
+        if (!ReadValue(data, len, off, frame)) return;
+        if (!ReadValue(data, len, off, alive)) return;
+        MpProjectile p(x, y, 0.0f, 0.0f, angle, -1);
+        p.frame = frame;
+        p.alive = alive != 0;
+        mpProjectiles.push_back(p);
+    }
+}
+
+static std::mt19937 rng;
+enum class GameState { Menu, Playing, Paused, Options, GameOver, MultiplayerMenu, MultiplayerLobby, MultiplayerPlaying, MultiplayerOver };
+static GameState gameState = GameState::Menu;
+static void NetPoll() {
+    if (!netHost) return;
+    ENetEvent event;
+    while (enet_host_service(netHost, &event, 0) > 0) {
+        switch (event.type) {
+            case ENET_EVENT_TYPE_CONNECT:
+                if (!netIsHost) {
+                    netConnected = true;
+                    NetSendJoinRequest();
+                }
+                break;
+            case ENET_EVENT_TYPE_RECEIVE: {
+                const Uint8 *data = event.packet->data;
+                size_t len = event.packet->dataLength;
+                if (len < 1) { enet_packet_destroy(event.packet); break; }
+                NetMsg type = (NetMsg)data[0];
+                size_t off = 1;
+                if (type == NetMsg::JoinRequest && netIsHost) {
+                    if (mpPlayers.size() >= kMpMaxPlayers) {
+                        enet_packet_destroy(event.packet);
+                        break;
+                    }
+                    char nameBuf[kMpNameLen] = {};
+                    if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                    MpPlayer p;
+                    p.id = (int)mpPlayers.size();
+                    p.name = nameBuf;
+                    p.rect = SDL_FRect{ 120.0f + 30.0f * p.id, 200.0f, 40.0f, 40.0f };
+                    p.alive = true;
+                    mpPlayers.push_back(p);
+
+                    std::vector<Uint8> buf;
+                    WriteValue(buf, (Uint8)NetMsg::JoinAccept);
+                    WriteValue(buf, (Uint8)p.id);
+                    Uint8 count = (Uint8)SDL_min((int)mpPlayers.size(), kMpMaxPlayers);
+                    WriteValue(buf, count);
+                    for (int i = 0; i < count; ++i) {
+                        WriteValue(buf, (Uint8)mpPlayers[i].id);
+                        char outName[kMpNameLen] = {};
+                        SDL_strlcpy(outName, mpPlayers[i].name.c_str(), sizeof(outName));
+                        WriteBytes(buf, outName, sizeof(outName));
+                    }
+                    ENetPacket *pkt = enet_packet_create(buf.data(), buf.size(), ENET_PACKET_FLAG_RELIABLE);
+                    enet_peer_send(event.peer, 0, pkt);
+                } else if (type == NetMsg::JoinAccept && !netIsHost) {
+                    Uint8 assigned = 0, count = 0;
+                    if (!ReadValue(data, len, off, assigned)) break;
+                    if (!ReadValue(data, len, off, count)) break;
+                    mpLocalId = assigned;
+                    mpPlayers.clear();
+                    for (int i = 0; i < count; ++i) {
+                        Uint8 id = 0;
+                        char nameBuf[kMpNameLen] = {};
+                        if (!ReadValue(data, len, off, id)) break;
+                        if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                        MpPlayer p;
+                        p.id = id;
+                        p.name = nameBuf;
+                        p.rect = SDL_FRect{ 120.0f + 30.0f * id, 200.0f, 40.0f, 40.0f };
+                        p.alive = true;
+                        mpPlayers.push_back(p);
+                    }
+                    gameState = GameState::MultiplayerPlaying;
+                    SDL_SetWindowMouseGrab(window, true);
+                    SDL_HideCursor();
+                } else if (type == NetMsg::Input && netIsHost) {
+                    Uint8 id = 0;
+                    MpInputState input;
+                    if (!ReadValue(data, len, off, id)) break;
+                    if (!ReadValue(data, len, off, input.buttons)) break;
+                    if (!ReadValue(data, len, off, input.aimX)) break;
+                    if (!ReadValue(data, len, off, input.aimY)) break;
+                    if (!ReadValue(data, len, off, input.shoot)) break;
+                    if (id < mpInputs.size()) {
+                        mpInputs[id] = input;
+                    }
+                } else if (type == NetMsg::Snapshot && !netIsHost) {
+                    NetHandleSnapshot(data + 1, len - 1);
+                } else if (type == NetMsg::KillNotice) {
+                    char nameBuf[kMpNameLen] = {};
+                    if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) break;
+                    KillPopup kp;
+                    kp.text = std::string(nameBuf) + " killed!";
+                    killPopups.push_back(kp);
+                } else if (type == NetMsg::MatchOver) {
+                    mpMatchOver = true;
+                }
+                enet_packet_destroy(event.packet);
+                break;
+            }
+            case ENET_EVENT_TYPE_DISCONNECT:
+                netConnected = false;
+                if (!netIsHost && (gameState == GameState::MultiplayerPlaying || gameState == GameState::MultiplayerOver)) {
+                    gameState = GameState::MultiplayerMenu;
+                    SDL_ShowCursor();
+                    SDL_SetWindowMouseGrab(window, false);
+                    SDL_StartTextInput(window);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+static SDL_FPoint MpGetTargetPoint() {
+    for (const auto &p : mpPlayers) {
+        if (p.alive) {
+            return SDL_FPoint{ p.rect.x + p.rect.w * 0.5f, p.rect.y + p.rect.h * 0.5f };
+        }
+    }
+    return SDL_FPoint{ kWinW * 0.5f, kWinH * 0.5f };
+}
+
+static void MpDamagePlayer(MpPlayer &p, int killerId) {
+    if (!p.alive || p.invincible) return;
+    p.health -= 1;
+    p.invincible = true;
+    p.invincibleTimer = 1.2f;
+    if (p.health <= 0) {
+        p.alive = false;
+        p.deaths += 1;
+        p.respawnTimer = 2.5f;
+        if (killerId >= 0 && killerId < (int)mpPlayers.size()) {
+            mpPlayers[killerId].score += 10;
+            mpPlayers[killerId].kills += 1;
+            NetSendKillPopup(p.name);
+            KillPopup kp;
+            kp.text = p.name + " killed!";
+            killPopups.push_back(kp);
+        }
+    }
+}
+
+static void MpRespawnPlayer(MpPlayer &p) {
+    p.health = 3;
+    p.alive = true;
+    p.invincible = true;
+    p.invincibleTimer = 1.5f;
+    p.vel = SDL_FPoint{0.0f, 0.0f};
+    p.rect = SDL_FRect{ kWinW * 0.5f - 20.0f, kWinH * 0.5f - 20.0f, 40.0f, 40.0f };
+}
+
+static void MpApplyInput(MpPlayer &p, const MpInputState &in, float dt) {
+    if (!p.alive) {
+        if (p.respawnTimer > 0.0f) {
+            p.respawnTimer -= dt;
+            if (p.respawnTimer <= 0.0f) {
+                MpRespawnPlayer(p);
+            }
+        }
+        return;
+    }
+
+    if (p.invincibleTimer > 0.0f) {
+        p.invincibleTimer -= dt;
+        if (p.invincibleTimer <= 0.0f) {
+            p.invincibleTimer = 0.0f;
+            p.invincible = false;
+        }
+    }
+
+    const float kGravity = 900.0f;
+    const float kJumpImpulse = -350.0f;
+    const float kDiveAccel = 1200.0f;
+    const float kFloorY = 480.0f;
+
+    bool leftDown = (in.buttons & kMpBtnLeft) != 0;
+    bool rightDown = (in.buttons & kMpBtnRight) != 0;
+    bool jumpDown = (in.buttons & kMpBtnJump) != 0;
+    bool downDown = (in.buttons & kMpBtnDown) != 0;
+
+    if (leftDown && !rightDown) {
+        p.vel.x = -200.0f;
+        p.facingRight = false;
+    } else if (rightDown && !leftDown) {
+        p.vel.x = 200.0f;
+        p.facingRight = true;
+    } else {
+        p.vel.x = 0.0f;
+    }
+
+    if (jumpDown && !p.wasJumpDown) {
+        p.vel.y = kJumpImpulse;
+    }
+    p.wasJumpDown = jumpDown;
+
+    p.vel.y += kGravity * dt;
+    if (downDown) {
+        p.vel.y += kDiveAccel * dt;
+    }
+    p.rect.x += p.vel.x * dt;
+    p.rect.y += p.vel.y * dt;
+
+    const float floor = kFloorY - p.rect.h;
+    if (p.rect.y > floor || p.rect.y < 0.0f || p.rect.x < 0.0f || p.rect.x + p.rect.w > (float)kWinW) {
+        MpDamagePlayer(p, -1);
+        p.rect.x = ClampF(p.rect.x, 0.0f, (float)kWinW - p.rect.w);
+        p.rect.y = ClampF(p.rect.y, 0.0f, floor);
+    }
+}
+
+static void MpSpawnBat() {
+    if (mpBats.size() >= kMpMaxBats) return;
+    std::uniform_real_distribution<float> xdist(-60.0f, kWinW + 60.0f);
+    std::uniform_real_distribution<float> ydist(-60.0f, kWinH + 60.0f);
+    std::uniform_real_distribution<float> speedDist(220.0f, 300.0f);
+    std::uniform_int_distribution<int> sideDist(0, 3);
+
+    float spawnX = kWinW + 80.0f;
+    float spawnY = kWinH * 0.5f;
+    int side = sideDist(rng);
+    if (side == 0) {
+        spawnX = kWinW + 80.0f;
+        spawnY = ydist(rng);
+    } else if (side == 1) {
+        spawnX = -80.0f;
+        spawnY = ydist(rng);
+    } else if (side == 2) {
+        spawnX = xdist(rng);
+        spawnY = -80.0f;
+    } else {
+        spawnX = xdist(rng);
+        spawnY = kWinH + 80.0f;
+    }
+
+    float spd = speedDist(rng);
+    mpBats.emplace_back(spawnX, spawnY, spd);
+}
+
+static void MpUpdateHost(float dt) {
+    if (mpMatchOver) return;
+    mpMatchTimer += dt;
+    if (mpMatchTimer >= kMpMatchDuration) {
+        mpMatchTimer = kMpMatchDuration;
+        mpMatchOver = true;
+        NetSendMatchOver();
+        return;
+    }
+
+    for (auto &p : mpPlayers) {
+        if (p.id >= 0 && p.id < (int)mpInputs.size()) {
+            MpApplyInput(p, mpInputs[p.id], dt);
+            if (p.id < (int)mpPrevShoot.size()) {
+                if (mpInputs[p.id].shoot && !mpPrevShoot[p.id]) {
+                    float pcx = p.rect.x + p.rect.w * 0.5f;
+                    float pcy = p.rect.y + p.rect.h * 0.5f;
+                    float dx = mpInputs[p.id].aimX - pcx;
+                    float dy = mpInputs[p.id].aimY - pcy;
+                    float len = SDL_sqrtf(dx*dx + dy*dy);
+                    if (len < 0.001f) len = 0.001f;
+                    dx /= len; dy /= len;
+                    const float speed = 400.0f;
+                    float vx = dx * speed;
+                    float vy = dy * speed;
+                    float angle = SDL_atan2(dy, dx) * (180.0f / SDL_PI_D);
+                    mpProjectiles.emplace_back(pcx, pcy, vx, vy, angle, p.id);
+                    if (mpProjectiles.size() > kMpMaxProjectiles) {
+                        mpProjectiles.erase(mpProjectiles.begin());
+                    }
+                }
+                mpPrevShoot[p.id] = mpInputs[p.id].shoot;
+            }
+        }
+    }
+
+    for (auto &proj : mpProjectiles) proj.Update(dt);
+    mpProjectiles.erase(std::remove_if(mpProjectiles.begin(), mpProjectiles.end(),
+        [](const MpProjectile &p){ return !p.alive; }), mpProjectiles.end());
+
+    mpBatSpawnTimer += dt;
+    if (mpBatSpawnTimer >= mpBatSpawnInterval) {
+        mpBatSpawnTimer = 0.0f;
+        MpSpawnBat();
+        float diff = ClampF(1.0f + mpMatchTimer * 0.02f, 1.0f, 3.0f);
+        mpBatSpawnInterval = ClampF(2.2f / diff, 0.8f, 2.2f);
+    }
+
+    SDL_FPoint target = MpGetTargetPoint();
+    for (auto &b : mpBats) {
+        b.Update(dt, target);
+    }
+    mpBats.erase(std::remove_if(mpBats.begin(), mpBats.end(), [](const Bat &b){ return !b.alive; }), mpBats.end());
+
+    for (auto &proj : mpProjectiles) {
+        if (!proj.alive) continue;
+        SDL_FRect projBox = proj.Bounds();
+        for (auto &b : mpBats) {
+            if (!b.alive || b.state != BatState::Moving) continue;
+            if (AABBOverlap(projBox, b.Bounds())) {
+                b.Kill();
+                proj.alive = false;
+                if (proj.ownerId >= 0 && proj.ownerId < (int)mpPlayers.size()) {
+                    mpPlayers[proj.ownerId].score += 1;
+                    mpPlayers[proj.ownerId].kills += 1;
+                }
+                break;
+            }
+        }
+    }
+
+    for (auto &proj : mpProjectiles) {
+        if (!proj.alive) continue;
+        SDL_FRect projBox = proj.Bounds();
+        for (auto &p : mpPlayers) {
+            if (!p.alive) continue;
+            if (p.id == proj.ownerId) continue;
+            if (AABBOverlap(projBox, p.rect)) {
+                proj.alive = false;
+                MpDamagePlayer(p, proj.ownerId);
+                break;
+            }
+        }
+    }
+
+    for (auto &b : mpBats) {
+        if (!b.alive || b.state != BatState::Moving) continue;
+        for (auto &p : mpPlayers) {
+            if (!p.alive) continue;
+            if (AABBOverlap(p.rect, b.Bounds())) {
+                b.Kill();
+                MpDamagePlayer(p, -1);
+                break;
+            }
+        }
+    }
+
+    for (auto &kp : killPopups) kp.timer += dt;
+    killPopups.erase(std::remove_if(killPopups.begin(), killPopups.end(),
+        [](const KillPopup &k){ return k.timer >= k.lifetime; }), killPopups.end());
+}
+
+static void MpUpdateClient(float dt) {
+    for (auto &kp : killPopups) kp.timer += dt;
+    killPopups.erase(std::remove_if(killPopups.begin(), killPopups.end(),
+        [](const KillPopup &k){ return k.timer >= k.lifetime; }), killPopups.end());
+}
+
+static void MpRenderPlayers() {
+    for (const auto &p : mpPlayers) {
+        if (!p.alive) continue;
+        SDL_Texture *tex = runningAnim.Current();
+        if (SDL_fabsf(p.vel.y) > 5.0f && flyingAnim.Current()) {
+            tex = flyingAnim.Current();
+        }
+        if (!tex) continue;
+        SDL_FlipMode flip = p.facingRight ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
+        SDL_RenderTextureRotated(renderer, tex, nullptr, &p.rect, 0.0, nullptr, flip);
+        RenderLabel(p.name, p.rect.x - 4.0f, p.rect.y - 16.0f);
+        if (p.invincible) {
+            SDL_SetRenderDrawColor(renderer, 120, 220, 255, 120);
+            SDL_FRect halo{ p.rect.x - 4.0f, p.rect.y - 4.0f, p.rect.w + 8.0f, p.rect.h + 8.0f };
+            SDL_RenderRect(renderer, &halo);
+        }
+    }
+}
+
+static void MpRenderHUD() {
+    SDL_Color white{255,255,255,255};
+    float x = 16.0f;
+    float y = 10.0f;
+    RenderLabel("MP MATCH", x, y);
+    y += 22.0f;
+
+    int remaining = (int)std::max(0.0f, kMpMatchDuration - mpMatchTimer);
+    char timeBuf[16];
+    SDL_snprintf(timeBuf, sizeof(timeBuf), "Time %02d:%02d", remaining / 60, remaining % 60);
+    RenderLabel(timeBuf, x, y);
+    y += 22.0f;
+
+    for (const auto &p : mpPlayers) {
+        std::string line = p.name + "  K:" + std::to_string(p.kills) +
+            " D:" + std::to_string(p.deaths) + " S:" + std::to_string(p.score);
+        RenderLabel(line, x, y);
+        y += 18.0f;
+    }
+}
+
+static void MpRenderMatchOver() {
+    RenderLabel("MATCH OVER", kWinW * 0.5f - 90.0f, kWinH * 0.5f - 80.0f);
+    std::vector<MpPlayer> sorted = mpPlayers;
+    std::sort(sorted.begin(), sorted.end(), [](const MpPlayer &a, const MpPlayer &b){
+        return a.score > b.score;
+    });
+    float y = kWinH * 0.5f - 40.0f;
+    for (const auto &p : sorted) {
+        std::string line = p.name + "  Score " + std::to_string(p.score) +
+            "  K:" + std::to_string(p.kills) + " D:" + std::to_string(p.deaths);
+        RenderLabel(line, kWinW * 0.5f - 160.0f, y);
+        y += 22.0f;
+    }
+    RenderLabel("ESC to exit", kWinW * 0.5f - 80.0f, y + 16.0f);
+}
+
+static void MpRenderKillPopups() {
+    if (killPopups.empty()) return;
+    double tNow = (double)SDL_GetTicks() / 1000.0;
+    float y = 80.0f;
+    for (const auto &kp : killPopups) {
+        SDL_Color col = RainbowColor((float)tNow, kp.timer * 120.0f);
+        SDL_Surface *surf = TTF_RenderText_Blended(font, kp.text.c_str(), 0, col);
+        if (!surf) continue;
+        SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+        if (tex) {
+            float w = (float)surf->w;
+            float h = (float)surf->h;
+            float x = kWinW * 0.5f - w * 0.5f;
+            float bob = SDL_sinf((float)(tNow * 4.0f)) * 6.0f;
+            SDL_SetTextureColorMod(tex, 0, 0, 0);
+            SDL_SetTextureAlphaMod(tex, 160);
+            SDL_FRect shadow{ x + 2.0f, y + bob + 2.0f, w, h };
+            SDL_RenderTexture(renderer, tex, nullptr, &shadow);
+            SDL_SetTextureColorMod(tex, col.r, col.g, col.b);
+            SDL_SetTextureAlphaMod(tex, 255);
+            SDL_FRect dst{ x, y + bob, w, h };
+            SDL_RenderTexture(renderer, tex, nullptr, &dst);
+            SDL_DestroyTexture(tex);
+        }
+        SDL_DestroySurface(surf);
+        y += 26.0f;
+    }
 }
 
 static bool LoadPausedLetters(SDL_Renderer *r, TTF_Font *f) {
@@ -571,10 +1499,7 @@ static float batSpawnTimer = 0.0f;
 static float batSpawnInterval = 3.5f;
 static int warningFrame = 0;
 static float warningTimer = 0.0f;
-static std::mt19937 rng;
 static uint64_t startTicks = 0;
-enum class GameState { Menu, Playing, Paused, Options, GameOver };
-static GameState gameState = GameState::Menu;
 static int bestCoins = 0;
 static float bestTime = 0.0f;
 
@@ -605,6 +1530,7 @@ struct MenuButton {
 };
 static MenuButton btnStart{ "START", {0,0,0,0}, false, 0.0f };
 static MenuButton btnOptions{ "OPTIONS", {0,0,0,0}, false, 0.4f };
+static MenuButton btnMultiplayer{ "MULTIPLAYER", {0,0,0,0}, false, 0.8f };
 static MenuButton btnQuit{ "QUIT", {0,0,0,0}, false, 0.8f };
 struct Demo {
     SDL_FPoint pos{240.0f, 260.0f};
@@ -711,6 +1637,11 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
         return SDL_APP_FAILURE;
     }
 
+    if (!InitNet()) {
+        SDL_Log("Couldn't initialize ENet.");
+    }
+    mpLocalIp = GetLocalIp();
+
     if (!gSoundManager.Init()) {
         SDL_Log("Couldn't initialize audio: %s", SDL_GetError());
     }
@@ -811,6 +1742,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     UpdateCachedText(menuTitleText, "Arr0wB1rd", white);
     UpdateCachedText(menuStartText, "START", white);
     UpdateCachedText(menuOptionsText, "OPTIONS", white);
+    UpdateCachedText(menuMultiplayerText, "MULTIPLAYER", white);
     UpdateCachedText(menuQuitText, "QUIT", white);
     UpdateCachedText(overTitleText, "GAME OVER!", white);
     UpdateCachedText(newRecordText, "NEW RECORD!", white);
@@ -833,6 +1765,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
         bestCoins = 0;
         bestTime = 0.0f;
     }
+    LoadSavedIps();
 
 
 
@@ -931,6 +1864,27 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
     if (event->type == SDL_EVENT_QUIT) {
         return SDL_APP_SUCCESS;  /* end the program, reporting success to the OS. */
     }
+    if (event->type == SDL_EVENT_TEXT_INPUT) {
+        if (gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) {
+            const char *txt = event->text.text;
+            if (mpNameActive && mpUserName.size() < (size_t)(kMpNameLen - 1)) {
+                mpUserName += txt;
+            } else if (mpIpActive && mpHostIp.size() < 64) {
+                mpHostIp += txt;
+            }
+        }
+    }
+    if (event->type == SDL_EVENT_KEY_DOWN) {
+        if (gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) {
+            if (event->key.scancode == SDL_SCANCODE_BACKSPACE) {
+                if (mpNameActive && !mpUserName.empty()) mpUserName.pop_back();
+                if (mpIpActive && !mpHostIp.empty()) mpHostIp.pop_back();
+            } else if (event->key.scancode == SDL_SCANCODE_TAB) {
+                mpNameActive = !mpNameActive;
+                mpIpActive = !mpIpActive;
+            }
+        }
+    }
     return SDL_APP_CONTINUE;  /* carry on with the program! */
 }
 
@@ -1008,13 +1962,28 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             optionsFromPaused = false;
             last = SDL_GetPerformanceCounter();
             dt = 0.0f;
+        } else if (gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) {
+            NetDisconnect();
+            gameState = GameState::Menu;
+            SDL_StopTextInput(window);
+            SDL_ShowCursor();
+            SDL_SetWindowMouseGrab(window, false);
+        } else if (gameState == GameState::MultiplayerPlaying || gameState == GameState::MultiplayerOver) {
+            NetDisconnect();
+            gameState = GameState::Menu;
+            SDL_StopTextInput(window);
+            SDL_ShowCursor();
+            SDL_SetWindowMouseGrab(window, false);
         }
     }
     wasEscapeDown = escapeDown;
     wasF12Down = f12Down;
 
-    if (playerDead || player.dead || gameState == GameState::Paused ||
-        (gameState == GameState::Options && optionsFromPaused)) {
+    NetPoll();
+
+    if ((gameState == GameState::Playing || gameState == GameState::Paused || gameState == GameState::GameOver) &&
+        (playerDead || player.dead || gameState == GameState::Paused ||
+        (gameState == GameState::Options && optionsFromPaused))) {
         dt = 0.0f;
     }
 
@@ -1080,6 +2049,51 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     nearTrees.Update(dt);
     nearTrees.Render(renderer, (float)kWinW);
+
+    bool inMultiplayer = (gameState == GameState::MultiplayerPlaying || gameState == GameState::MultiplayerOver);
+    if (gameState == GameState::MultiplayerPlaying) {
+        MpInputState localInput;
+        const bool *keys = SDL_GetKeyboardState(nullptr);
+        localInput.buttons |= (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT]) ? kMpBtnLeft : 0;
+        localInput.buttons |= (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]) ? kMpBtnRight : 0;
+        localInput.buttons |= (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_SPACE]) ? kMpBtnJump : 0;
+        localInput.buttons |= (keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN]) ? kMpBtnDown : 0;
+        float mx = 0.0f, my = 0.0f;
+        Uint32 mstate = 0;
+        GetLogicalMouse(mx, my, mstate);
+        localInput.aimX = mx;
+        localInput.aimY = my;
+        localInput.shoot = (mstate & SDL_BUTTON_LMASK) ? 1 : 0;
+
+        if (mpLocalId >= 0 && mpLocalId < (int)mpInputs.size()) {
+            mpInputs[mpLocalId] = localInput;
+        }
+        if (!netIsHost) {
+            NetSendInput(mpLocalId, localInput);
+        }
+    }
+
+    if (gameState == GameState::MultiplayerPlaying && netIsHost) {
+        MpUpdateHost(dt);
+        mpSnapshotTimer += dt;
+        if (mpSnapshotTimer >= 0.05f) {
+            mpSnapshotTimer = 0.0f;
+            NetSendSnapshot();
+        }
+        if (mpMatchOver) {
+            gameState = GameState::MultiplayerOver;
+        }
+    } else if (gameState == GameState::MultiplayerPlaying && !netIsHost) {
+        MpUpdateClient(dt);
+        if (mpMatchOver) {
+            gameState = GameState::MultiplayerOver;
+        }
+    }
+    if (inMultiplayer) {
+        runningAnim.Update(dt);
+        flyingAnim.Update(dt);
+    }
+
 
     for (auto &ft : floatingTexts) ft.Update(dt);
     for (auto &ft : floatingTexts) ft.Render(renderer);
@@ -1242,8 +2256,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         if (magnetTimer <= 0.0f) { magnetActive = false; magnetTimer = 0.0f; }
     }
     if (shieldActive) {
-        shieldTimer -= dt;
-        if (shieldTimer <= 0.0f) { shieldActive = false; shieldTimer = 0.0f; }
+        shieldTimer = 0.0f; // shield lasts until a hit consumes it
     }
     if (shieldActive && dt > 0.0f) {
         shieldAnimTimer += dt;
@@ -1364,6 +2377,14 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             ResetGameState();
             SDL_SetWindowMouseGrab(window, true);
             SDL_HideCursor();
+        } else if (btnMultiplayer.hover) {
+            gSoundManager.PlaySound("coin");
+            gameState = GameState::MultiplayerMenu;
+            mpNameActive = true;
+            mpIpActive = false;
+            SDL_StartTextInput(window);
+            SDL_ShowCursor();
+            SDL_SetWindowMouseGrab(window, false);
         } else if (btnOptions.hover) {
             gSoundManager.PlaySound("coin");
             optionsFromPaused = false;
@@ -1374,6 +2395,63 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             SDL_Event quitEvent;
             quitEvent.type = SDL_EVENT_QUIT;
             SDL_PushEvent(&quitEvent);
+        }
+    }
+
+    if ((gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) && mouseDown && !wasMouseDown) {
+        if (mx >= mpNameBox.x && mx <= mpNameBox.x + mpNameBox.w &&
+            my >= mpNameBox.y && my <= mpNameBox.y + mpNameBox.h) {
+            mpNameActive = true;
+            mpIpActive = false;
+        } else if (mx >= mpIpBox.x && mx <= mpIpBox.x + mpIpBox.w &&
+                   my >= mpIpBox.y && my <= mpIpBox.y + mpIpBox.h) {
+            mpNameActive = false;
+            mpIpActive = true;
+        } else if (mx >= mpHostBtn.x && mx <= mpHostBtn.x + mpHostBtn.w &&
+                   my >= mpHostBtn.y && my <= mpHostBtn.y + mpHostBtn.h) {
+            if (NetStartHost()) {
+                gameState = GameState::MultiplayerPlaying;
+                SDL_StopTextInput(window);
+                SDL_SetWindowMouseGrab(window, true);
+                SDL_HideCursor();
+                mpSnapshotTimer = 0.0f;
+                if (!mpHostIp.empty()) {
+                    mpSavedIps.erase(std::remove(mpSavedIps.begin(), mpSavedIps.end(), mpHostIp), mpSavedIps.end());
+                    mpSavedIps.push_front(mpHostIp);
+                    while (mpSavedIps.size() > 5) mpSavedIps.pop_back();
+                    SaveSavedIps();
+                }
+            }
+        } else if (mx >= mpJoinBtn.x && mx <= mpJoinBtn.x + mpJoinBtn.w &&
+                   my >= mpJoinBtn.y && my <= mpJoinBtn.y + mpJoinBtn.h) {
+            if (NetStartClient(mpHostIp)) {
+                gameState = GameState::MultiplayerLobby;
+                SDL_StopTextInput(window);
+                if (!mpHostIp.empty()) {
+                    mpSavedIps.erase(std::remove(mpSavedIps.begin(), mpSavedIps.end(), mpHostIp), mpSavedIps.end());
+                    mpSavedIps.push_front(mpHostIp);
+                    while (mpSavedIps.size() > 5) mpSavedIps.pop_back();
+                    SaveSavedIps();
+                }
+            }
+        } else if (mx >= mpBackBtn.x && mx <= mpBackBtn.x + mpBackBtn.w &&
+                   my >= mpBackBtn.y && my <= mpBackBtn.y + mpBackBtn.h) {
+            NetDisconnect();
+            gameState = GameState::Menu;
+            SDL_StopTextInput(window);
+        } else {
+            for (int i = 0; i < 5; ++i) {
+                const SDL_FRect &box = mpSavedBoxes[i];
+                if (box.w <= 0.0f) continue;
+                if (mx >= box.x && mx <= box.x + box.w &&
+                    my >= box.y && my <= box.y + box.h) {
+                    if (i < (int)mpSavedIps.size()) {
+                        mpHostIp = mpSavedIps[i];
+                        mpIpActive = true;
+                        mpNameActive = false;
+                    }
+                }
+            }
         }
     }
 
@@ -1560,6 +2638,8 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     comboTimer = comboTimeout;
                     UpdateComboText();
                     TriggerComboPopup();
+                    shieldActive = false;
+                    shieldTimer = 0.0f;
                     continue;
                 }
                 gSoundManager.PlaySound("bat_hit");
@@ -1589,7 +2669,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                     magnetTimer = 10.0f;
                 } else if (p.type == PowerupType::Shield) {
                     shieldActive = true;
-                    shieldTimer = 10.0f;
+                    shieldTimer = 0.0f;
                 } else if (p.type == PowerupType::Spread) {
                     spreadActive = true;
                     spreadTimer = 8.0f;
@@ -1605,7 +2685,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
 
     // then draw
-    if (gameState != GameState::Menu && !(gameState == GameState::Options && !optionsFromPaused)) {
+    if (gameState == GameState::Playing || gameState == GameState::Paused || gameState == GameState::GameOver) {
         player.Render(renderer);
 
         // Shield animation overlay
@@ -1639,7 +2719,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             float bob = p.amp * SDL_sinf(p.freq * p.t + p.phase);
             SDL_FRect dst{ p.pos.x - sz * 0.5f, p.pos.y - sz * 0.5f + bob, sz, sz };
             if (tex) {
+                if (p.type == PowerupType::Spread) SDL_SetTextureColorMod(tex, 64, 200, 255);
                 SDL_RenderTexture(renderer, tex, nullptr, &dst);
+                if (p.type == PowerupType::Spread) SDL_SetTextureColorMod(tex, 255, 255, 255);
             } else {
                 SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
                 SDL_RenderFillRect(renderer, &dst);
@@ -1652,6 +2734,17 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         for (const auto &wicon : warningIcons) {
             SDL_RenderTexture(renderer, warningFrames[warningFrame], nullptr, &wicon);
         }
+    }
+
+    if (inMultiplayer) {
+        for (auto &b : mpBats) {
+            b.Render(renderer);
+        }
+        for (auto &p : mpProjectiles) {
+            p.Render(renderer);
+        }
+        MpRenderPlayers();
+        MpRenderKillPopups();
     }
 
     // Aim arrow following mouse (larger and closer) only during play
@@ -1681,7 +2774,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     }
 
     // Custom cursor rendered at the actual mouse position while hidden system cursor is off
-    if (gameState == GameState::Playing && cursorTex) {
+    if ((gameState == GameState::Playing || gameState == GameState::MultiplayerPlaying) && cursorTex) {
         float cx = 0.0f, cy = 0.0f;
         GetLogicalMouse(cx, cy);
         if (cx < 0.0f) cx = 0.0f;
@@ -1954,6 +3047,13 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         }
     }
 
+    if (gameState == GameState::MultiplayerPlaying || gameState == GameState::MultiplayerOver) {
+        MpRenderHUD();
+        if (gameState == GameState::MultiplayerOver) {
+            MpRenderMatchOver();
+        }
+    }
+
     // Paused wave text overlay
     if (gameState == GameState::Paused) {
         double t = (double)SDL_GetTicks() / 1000.0;
@@ -2042,15 +3142,20 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         btnStart.bounds.x = kWinW * 0.5f - btnStart.bounds.w * 0.5f;
         btnStart.bounds.y = 120.0f;
 
+        btnMultiplayer.bounds.w = menuMultiplayerText.w;
+        btnMultiplayer.bounds.h = menuMultiplayerText.h;
+        btnMultiplayer.bounds.x = kWinW * 0.5f - btnMultiplayer.bounds.w * 0.5f;
+        btnMultiplayer.bounds.y = 160.0f;
+
         btnOptions.bounds.w = menuOptionsText.w;
         btnOptions.bounds.h = menuOptionsText.h;
         btnOptions.bounds.x = kWinW * 0.5f - btnOptions.bounds.w * 0.5f;
-        btnOptions.bounds.y = 160.0f;
+        btnOptions.bounds.y = 200.0f;
         
         btnQuit.bounds.w = menuQuitText.w;
         btnQuit.bounds.h = menuQuitText.h;
         btnQuit.bounds.x = kWinW * 0.5f - btnQuit.bounds.w * 0.5f;
-        btnQuit.bounds.y = 200.0f;
+        btnQuit.bounds.y = 240.0f;
 
         Uint32 mstate = SDL_GetMouseState(nullptr, nullptr);
         float mx=0.0f, my=0.0f; GetLogicalMouse(mx,my);
@@ -2060,10 +3165,11 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         };
         if (gameState == GameState::Menu) {
             hoverCheck(btnStart);
+            hoverCheck(btnMultiplayer);
             hoverCheck(btnOptions);
             hoverCheck(btnQuit);
         } else {
-            btnStart.hover = btnOptions.hover = btnQuit.hover = false;
+            btnStart.hover = btnMultiplayer.hover = btnOptions.hover = btnQuit.hover = false;
         }
 
         auto renderButton = [&](const MenuButton &b, float phase){
@@ -2071,6 +3177,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             Uint8 alpha = b.hover ? (Uint8)(200 + 55 * (0.5f + 0.5f * SDL_sinf((float)t * 6.0f + phase))) : 255;
             CachedText *ct = nullptr;
             if (b.label == "START") ct = &menuStartText;
+            else if (b.label == "MULTIPLAYER") ct = &menuMultiplayerText;
             else if (b.label == "OPTIONS") ct = &menuOptionsText;
             else if (b.label == "QUIT") ct = &menuQuitText;
             if (ct && ct->tex) {
@@ -2088,8 +3195,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         };
         if (gameState == GameState::Menu) {
             renderButton(btnStart, 0.0f);
+            renderButton(btnMultiplayer, 0.6f);
             renderButton(btnOptions, 1.0f);
-            renderButton(btnQuit, 2.0f);
+            renderButton(btnQuit, 1.6f);
         }
 
         // demo player + arrow + demo shots
@@ -2113,6 +3221,64 @@ SDL_AppResult SDL_AppIterate(void *appstate)
                 SDL_RenderTextureRotated(renderer, arrowTex, nullptr, &adst, demo.angleDeg, nullptr, SDL_FLIP_NONE);
             }
         }
+    }
+
+    // Multiplayer menu / lobby
+    if (gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) {
+        float centerX = kWinW * 0.5f;
+        const float mpScale = 0.75f;
+        const float mpHeaderScale = 0.9f;
+        RenderLabelScaled("MULTIPLAYER", centerX - 110.0f, 40.0f, mpHeaderScale);
+
+        mpNameBox = SDL_FRect{ centerX - 150.0f, 110.0f, 300.0f, 36.0f };
+        mpIpBox = SDL_FRect{ centerX - 150.0f, 164.0f, 300.0f, 36.0f };
+        mpHostBtn = SDL_FRect{ centerX - 150.0f, 210.0f, 140.0f, 30.0f };
+        mpJoinBtn = SDL_FRect{ centerX + 10.0f, 210.0f, 140.0f, 30.0f };
+        mpBackBtn = SDL_FRect{ centerX - 60.0f, 260.0f, 120.0f, 26.0f };
+
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 140);
+        SDL_RenderFillRect(renderer, &mpNameBox);
+        SDL_RenderFillRect(renderer, &mpIpBox);
+
+        SDL_SetRenderDrawColor(renderer, mpNameActive ? 255 : 140, mpNameActive ? 255 : 140, mpNameActive ? 255 : 140, 255);
+        SDL_RenderRect(renderer, &mpNameBox);
+        SDL_SetRenderDrawColor(renderer, mpIpActive ? 255 : 140, mpIpActive ? 255 : 140, mpIpActive ? 255 : 140, 255);
+        SDL_RenderRect(renderer, &mpIpBox);
+
+        RenderLabelScaled("Name", mpNameBox.x - 70.0f, mpNameBox.y + 8.0f, mpScale);
+        RenderLabelScaled("Join IP", mpIpBox.x - 90.0f, mpIpBox.y + 8.0f, mpScale);
+        RenderLabelScaled(mpUserName, mpNameBox.x + 8.0f, mpNameBox.y + 10.0f, mpScale);
+        RenderLabelScaled(mpHostIp, mpIpBox.x + 8.0f, mpIpBox.y + 10.0f, mpScale);
+
+        SDL_SetRenderDrawColor(renderer, 30, 30, 30, 200);
+        SDL_RenderFillRect(renderer, &mpHostBtn);
+        SDL_RenderFillRect(renderer, &mpJoinBtn);
+        SDL_RenderFillRect(renderer, &mpBackBtn);
+        RenderLabelScaled("HOST", mpHostBtn.x + 42.0f, mpHostBtn.y + 6.0f, mpScale);
+        RenderLabelScaled("JOIN", mpJoinBtn.x + 44.0f, mpJoinBtn.y + 6.0f, mpScale);
+        RenderLabelScaled("BACK", mpBackBtn.x + 38.0f, mpBackBtn.y + 5.0f, mpScale);
+
+        float listY = 320.0f;
+        RenderLabelScaled("Saved IPs", centerX - 80.0f, listY, mpScale);
+        listY += 26.0f;
+        int idx = 0;
+        for (const auto &ip : mpSavedIps) {
+            if (idx >= 5) break;
+            mpSavedBoxes[idx] = SDL_FRect{ centerX - 120.0f, listY, 240.0f, 22.0f };
+            SDL_SetRenderDrawColor(renderer, 20, 20, 20, 180);
+            SDL_RenderFillRect(renderer, &mpSavedBoxes[idx]);
+            RenderLabelScaled(ip, mpSavedBoxes[idx].x + 6.0f, mpSavedBoxes[idx].y + 3.0f, mpScale);
+            listY += 26.0f;
+            idx++;
+        }
+        for (; idx < 5; ++idx) {
+            mpSavedBoxes[idx] = SDL_FRect{ 0,0,0,0 };
+        }
+
+        if (gameState == GameState::MultiplayerLobby) {
+            RenderLabelScaled(netIsHost ? "Waiting for players..." : "Connecting...", centerX - 150.0f, 430.0f, mpScale);
+        }
+        RenderLabelScaled("Your IP (share): " + mpLocalIp, centerX - 150.0f, 460.0f, mpScale);
     }
 
     // Options with volume sliders
@@ -2270,6 +3436,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 void SDL_AppQuit(void *appstate, SDL_AppResult result)
 {
     /* SDL will clean up the window/renderer for us. */
+    ShutdownNet();
 
     if (bgTexture) {
         SDL_DestroyTexture(bgTexture);
@@ -2301,6 +3468,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
+    DestroyCached(menuMultiplayerText);
     DestroyCached(menuQuitText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);
@@ -2337,6 +3505,7 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     DestroyCached(menuTitleText);
     DestroyCached(menuStartText);
     DestroyCached(menuOptionsText);
+    DestroyCached(menuMultiplayerText);
     DestroyCached(menuQuitText);
     DestroyCached(optionsStateText);
     DestroyCached(overTitleText);

@@ -11,6 +11,14 @@ SDLBirdGame is an arcade side-scroller built with SDL3. You control a bird that 
 - Score increases based on hits and combo thresholds.
 - Best score/coins/time are saved between runs.
 
+## Multiplayer (Online)
+- New Multiplayer menu for hosting or joining a match over the internet (host-player model).
+- Up to 10 birds can connect to a host in a 5-minute match.
+- Bats and PvP both count toward score; killing another player grants +10 points.
+- Players have 3 health, can respawn, and deaths are tracked on the scoreboard.
+- Rainbow "player killed!" popups appear on kills.
+- Saved IPs let you rejoin friends quickly (stored in `records/ips.txt`).
+
 ## Controls
 - `W` or `Space`: flap / start the run
 - `A/D` or Left/Right arrows: move horizontally
@@ -29,8 +37,8 @@ SDLBirdGame is an arcade side-scroller built with SDL3. You control a bird that 
 - Layered parallax background (sky, clouds, mountains, trees).
 - Animated sprites for the bird, bats, coins, shields, and projectiles.
 - HUD with animated coin icon, time counter, score, and combo display.
-- “NICE!” popup when combo reaches the threshold.
-- “Beat Score!” popup with rainbow wave when a new best score is reached.
+- "NICE!" popup when combo reaches the threshold.
+- "Beat Score!" popup with rainbow wave when a new best score is reached.
 - Game Over screen shows coins, score, time, and best score with a subtle bob animation.
 
 ## Powerups
@@ -39,10 +47,10 @@ SDLBirdGame is an arcade side-scroller built with SDL3. You control a bird that 
 - Spread: changes projectile behavior for a short duration.
 
 ## Build / Run
-Requires SDL3, SDL3_image, SDL3_ttf. Adjust paths as needed.
+Requires SDL3, SDL3_image, SDL3_ttf, and ENet. Adjust paths as needed.
 
 ```ps1
-g++ -O2 -s main.cpp core/utils.cpp core/parallax.cpp player/player.cpp player/bat.cpp audio/audio.cpp core/floating_text.cpp collectables/coin.cpp core/sprite_anim.cpp core/projectile.cpp records/record.cpp -o MusiccGame.exe -I "C:\Users\deadt\Downloads\SDL\x86_64-w64-mingw32\include" -I "C:\Users\deadt\Downloads\SDL3_image-devel-3.2.4-mingw\SDL3_image-3.2.4\x86_64-w64-mingw32\include" -L "C:\Users\deadt\Downloads\SDL\x86_64-w64-mingw32\lib" -L "C:\Users\deadt\Downloads\SDL3_image-devel-3.2.4-mingw\SDL3_image-3.2.4\x86_64-w64-mingw32\lib" -lSDL3_image -lSDL3 -lSDL3_ttf
+g++ -O2 -s main.cpp core/utils.cpp core/parallax.cpp player/player.cpp player/bat.cpp audio/audio.cpp core/floating_text.cpp collectables/coin.cpp core/sprite_anim.cpp core/projectile.cpp records/record.cpp -o MusiccGame.exe -I "C:\Users\deadt\Downloads\SDL\x86_64-w64-mingw32\include" -I "C:\Users\deadt\Downloads\SDL3_image-devel-3.2.4-mingw\SDL3_image-3.2.4\x86_64-w64-mingw32\include" -I "C:\Path\To\ENet\include" -L "C:\Users\deadt\Downloads\SDL\x86_64-w64-mingw32\lib" -L "C:\Users\deadt\Downloads\SDL3_image-devel-3.2.4-mingw\SDL3_image-3.2.4\x86_64-w64-mingw32\lib" -L "C:\Path\To\ENet\lib" -lSDL3_image -lSDL3 -lSDL3_ttf -lenet
 ```
 
 Run `MusiccGame.exe` from the `MusiccGame` folder so assets load correctly.

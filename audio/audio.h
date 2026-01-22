@@ -6,6 +6,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef PlaySound
+#undef PlaySound
+#endif
+
 class SoundManager {
 public:
     SoundManager();
