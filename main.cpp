@@ -32,6 +32,25 @@
 
 
 
+struct MpColorOption {
+    const char *name;
+    SDL_Color color;
+};
+
+static const MpColorOption kMpColors[] = {
+    {"Red", {255, 60, 60, 255}},
+    {"Orange", {255, 140, 40, 255}},
+    {"Yellow", {255, 220, 60, 255}},
+    {"Green", {60, 200, 80, 255}},
+    {"Blue", {60, 140, 255, 255}},
+    {"Indigo", {90, 80, 200, 255}},
+    {"Violet", {170, 60, 220, 255}},
+    {"Light Blue", {80, 220, 255, 255}},
+    {"Pink", {255, 90, 170, 255}},
+    {"White", {255, 255, 255, 255}}
+};
+
+
 static SDL_Window *window = NULL;
 SDL_Renderer *renderer = NULL;
 TTF_Font *font = nullptr;
@@ -172,6 +191,7 @@ enum class NetMsg : Uint8 {
 struct JoinRequestPacket {
     Uint8 type;
     char name[kMpNameLen];
+    Uint8 colorIndex;
 };
 
 struct JoinAcceptHeader {
@@ -183,6 +203,7 @@ struct JoinAcceptHeader {
 struct JoinAcceptEntry {
     Uint8 id;
     char name[kMpNameLen];
+    Uint8 colorIndex;
 };
 
 struct InputPacket {
@@ -222,6 +243,7 @@ struct MpInputState {
 struct MpPlayer {
     int id = -1;
     std::string name;
+    int colorIndex = 0;
     SDL_FRect rect{0,0,40,40};
     SDL_FRect targetRect{0,0,40,40};
     SDL_FPoint vel{0.0f, 0.0f};
@@ -303,6 +325,8 @@ static bool mpMatchOver = false;
 static std::string mpUserName = "Player";
 static std::string mpHostIp = "127.0.0.1";
 static std::string mpLocalIp = "Unknown";
+static int mpColorIndex = 0;
+static bool mpColorOpen = false;
 static bool mpNameActive = false;
 static bool mpIpActive = false;
 static std::deque<std::string> mpSavedIps;
@@ -314,6 +338,7 @@ static SDL_FRect mpJoinBtn{0,0,0,0};
 static SDL_FRect mpBackBtn{0,0,0,0};
 static SDL_FRect mpNameBox{0,0,0,0};
 static SDL_FRect mpIpBox{0,0,0,0};
+static SDL_FRect mpColorBox{0,0,0,0};
 static SDL_FRect mpSavedBoxes[5];
 
 struct WaveTextCache {
@@ -918,6 +943,7 @@ static void NetSendJoinRequest() {
     JoinRequestPacket pkt{};
     pkt.type = (Uint8)NetMsg::JoinRequest;
     SDL_strlcpy(pkt.name, mpUserName.c_str(), sizeof(pkt.name));
+    pkt.colorIndex = (Uint8)mpColorIndex;
     ENetPacket *packet = enet_packet_create(&pkt, sizeof(pkt), ENET_PACKET_FLAG_RELIABLE);
     enet_peer_send(netServer, 0, packet);
 }
@@ -961,6 +987,7 @@ static void NetSendSnapshot() {
         char nameBuf[kMpNameLen] = {};
         SDL_strlcpy(nameBuf, p.name.c_str(), sizeof(nameBuf));
         WriteBytes(buf, nameBuf, sizeof(nameBuf));
+        WriteValue(buf, (Uint8)p.colorIndex);
         WriteValue(buf, p.rect.x);
         WriteValue(buf, p.rect.y);
         WriteValue(buf, p.vel.x);
@@ -1044,6 +1071,8 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
         if (!ReadValue(data, len, off, id)) return;
         char nameBuf[kMpNameLen] = {};
         if (!ReadBytes(data, len, off, nameBuf, sizeof(nameBuf))) return;
+        Uint8 colorIdx = 0;
+        if (!ReadValue(data, len, off, colorIdx)) return;
         if (!ReadValue(data, len, off, p.rect.x)) return;
         if (!ReadValue(data, len, off, p.rect.y)) return;
         if (!ReadValue(data, len, off, p.vel.x)) return;
@@ -1058,6 +1087,7 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
         if (!ReadValue(data, len, off, p.respawnTimer)) return;
         p.id = id;
         p.name = nameBuf;
+        p.colorIndex = colorIdx % (int)(sizeof(kMpColors) / sizeof(kMpColors[0]));
         p.health = health;
         p.alive = alive != 0;
         p.facingRight = facing != 0;
@@ -1145,6 +1175,8 @@ static void NetHandleSnapshot(const Uint8 *data, size_t len) {
 static std::mt19937 rng;
 enum class GameState { Menu, Playing, Paused, Options, GameOver, MultiplayerMenu, MultiplayerLobby, MultiplayerPlaying, MultiplayerOver };
 static GameState gameState = GameState::Menu;
+
+
 static void NetPoll() {
     if (!netHost) return;
     ENetEvent event;
@@ -1174,6 +1206,7 @@ static void NetPoll() {
                     p.id = FindFreePlayerId();
                     if (p.id < 0) break;
                     p.name = req.name;
+                    p.colorIndex = req.colorIndex % (int)(sizeof(kMpColors) / sizeof(kMpColors[0]));
                     p.rect = SDL_FRect{ 120.0f + 30.0f * p.id, 200.0f, 40.0f, 40.0f };
                     p.alive = true;
                     p.connected = true;
@@ -1196,6 +1229,7 @@ static void NetPoll() {
                         JoinAcceptEntry entry{};
                         entry.id = (Uint8)pl.id;
                         SDL_strlcpy(entry.name, pl.name.c_str(), sizeof(entry.name));
+                        entry.colorIndex = (Uint8)pl.colorIndex;
                         WriteBytes(buf, &entry, sizeof(entry));
                         sent++;
                     }
@@ -1216,6 +1250,7 @@ static void NetPoll() {
                         MpPlayer p;
                         p.id = entry.id;
                         p.name = entry.name;
+                        p.colorIndex = entry.colorIndex % (int)(sizeof(kMpColors) / sizeof(kMpColors[0]));
                         p.rect = SDL_FRect{ 120.0f + 30.0f * entry.id, 200.0f, 40.0f, 40.0f };
                         p.targetRect = p.rect;
                         p.alive = true;
@@ -1301,6 +1336,24 @@ static void MpDamagePlayer(MpPlayer &p, int killerId) {
     }
 }
 
+static void MpForceKillPlayer(MpPlayer &p, int killerId) {
+    if (!p.alive) return;
+    p.health = 0;
+    p.alive = false;
+    p.invincible = false;
+    p.invincibleTimer = 0.0f;
+    p.deaths += 1;
+    p.respawnTimer = 2.5f;
+    if (killerId >= 0 && killerId < (int)mpPlayers.size()) {
+        mpPlayers[killerId].score += 10;
+        mpPlayers[killerId].kills += 1;
+        NetSendKillPopup(p.name);
+        KillPopup kp;
+        kp.text = p.name + " killed!";
+        killPopups.push_back(kp);
+    }
+}
+
 static void MpRespawnPlayer(MpPlayer &p) {
     p.health = 3;
     p.alive = true;
@@ -1363,7 +1416,7 @@ static void MpApplyInput(MpPlayer &p, const MpInputState &in, float dt) {
 
     const float floor = kFloorY - p.rect.h;
     if (p.rect.y > floor || p.rect.y < 0.0f || p.rect.x < 0.0f || p.rect.x + p.rect.w > (float)kWinW) {
-        MpDamagePlayer(p, -1);
+        MpForceKillPlayer(p, -1);
         p.rect.x = ClampF(p.rect.x, 0.0f, (float)kWinW - p.rect.w);
         p.rect.y = ClampF(p.rect.y, 0.0f, floor);
     }
@@ -1474,7 +1527,7 @@ static void MpUpdateHost(float dt) {
         for (auto &p : mpPlayers) {
             if (!p.alive) continue;
             if (p.id == proj.ownerId) continue;
-            if (AABBOverlap(projBox, p.rect)) {
+            if (AABBOverlap(projBox, GetBirdBatHitbox(p.rect))) {
                 proj.alive = false;
                 MpDamagePlayer(p, proj.ownerId);
                 break;
@@ -1528,8 +1581,11 @@ static void MpRenderPlayers() {
             tex = flyingAnim.Current();
         }
         if (!tex) continue;
+        SDL_Color col = kMpColors[p.colorIndex % (int)(sizeof(kMpColors) / sizeof(kMpColors[0]))].color;
+        SDL_SetTextureColorMod(tex, col.r, col.g, col.b);
         SDL_FlipMode flip = p.facingRight ? SDL_FLIP_NONE : SDL_FLIP_HORIZONTAL;
         SDL_RenderTextureRotated(renderer, tex, nullptr, &p.rect, 0.0, nullptr, flip);
+        SDL_SetTextureColorMod(tex, 255, 255, 255);
         RenderLabel(p.name, p.rect.x - 4.0f, p.rect.y - 16.0f);
         if (p.invincible) {
             SDL_SetRenderDrawColor(renderer, 120, 220, 255, 120);
@@ -2601,14 +2657,45 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     }
 
     if ((gameState == GameState::MultiplayerMenu || gameState == GameState::MultiplayerLobby) && mouseDown && !wasMouseDown) {
+        if (mpColorOpen) {
+            float optY = mpColorBox.y - 4.0f - 22.0f * (float)(sizeof(kMpColors) / sizeof(kMpColors[0]));
+            bool picked = false;
+            for (int i = 0; i < (int)(sizeof(kMpColors) / sizeof(kMpColors[0])); ++i) {
+                SDL_FRect optBox{ mpColorBox.x, optY, mpColorBox.w, 20.0f };
+                if (mx >= optBox.x && mx <= optBox.x + optBox.w &&
+                    my >= optBox.y && my <= optBox.y + optBox.h) {
+                    mpColorIndex = i;
+                    mpColorOpen = false;
+                    picked = true;
+                    break;
+                }
+                optY += 22.0f;
+            }
+            if (!picked) {
+                if (!(mx >= mpColorBox.x && mx <= mpColorBox.x + mpColorBox.w &&
+                      my >= mpColorBox.y && my <= mpColorBox.y + mpColorBox.h)) {
+                    mpColorOpen = false;
+                }
+            }
+            // Avoid clicking buttons under the dropdown.
+            wasMouseDown = mouseDown;
+            goto SkipMpClick;
+        }
         if (mx >= mpNameBox.x && mx <= mpNameBox.x + mpNameBox.w &&
             my >= mpNameBox.y && my <= mpNameBox.y + mpNameBox.h) {
             mpNameActive = true;
             mpIpActive = false;
+            mpColorOpen = false;
         } else if (mx >= mpIpBox.x && mx <= mpIpBox.x + mpIpBox.w &&
                    my >= mpIpBox.y && my <= mpIpBox.y + mpIpBox.h) {
             mpNameActive = false;
             mpIpActive = true;
+            mpColorOpen = false;
+        } else if (mx >= mpColorBox.x && mx <= mpColorBox.x + mpColorBox.w &&
+                   my >= mpColorBox.y && my <= mpColorBox.y + mpColorBox.h) {
+            mpColorOpen = !mpColorOpen;
+            mpNameActive = false;
+            mpIpActive = false;
         } else if (mx >= mpHostBtn.x && mx <= mpHostBtn.x + mpHostBtn.w &&
                    my >= mpHostBtn.y && my <= mpHostBtn.y + mpHostBtn.h) {
             if (NetStartHost()) {
@@ -2641,6 +2728,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             NetDisconnect();
             gameState = GameState::Menu;
             SDL_StopTextInput(window);
+            mpColorOpen = false;
         } else {
             for (int i = 0; i < 5; ++i) {
                 const SDL_FRect &box = mpSavedBoxes[i];
@@ -2656,6 +2744,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             }
         }
     }
+SkipMpClick: ;
 
     if (gameState == GameState::Playing && mouseDown && !wasMouseDown) {
         if (hudMenuText.tex) {
@@ -3433,25 +3522,29 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         const float mpHeaderScale = 0.9f;
         RenderLabelScaled("MULTIPLAYER", centerX - 110.0f, 40.0f, mpHeaderScale);
 
-        mpNameBox = SDL_FRect{ centerX - 150.0f, 110.0f, 300.0f, 36.0f };
-        mpIpBox = SDL_FRect{ centerX - 150.0f, 164.0f, 300.0f, 36.0f };
-        mpHostBtn = SDL_FRect{ centerX - 150.0f, 210.0f, 140.0f, 30.0f };
-        mpJoinBtn = SDL_FRect{ centerX + 10.0f, 210.0f, 140.0f, 30.0f };
-        mpBackBtn = SDL_FRect{ centerX - 60.0f, 260.0f, 120.0f, 26.0f };
+        mpNameBox = SDL_FRect{ 120.0f, 110.0f, 220.0f, 36.0f };
+        mpIpBox = SDL_FRect{ 120.0f, 164.0f, 220.0f, 36.0f };
+        mpColorBox = SDL_FRect{ 120.0f, 218.0f, 220.0f, 36.0f };
+        mpHostBtn = SDL_FRect{ centerX - 150.0f, 270.0f, 140.0f, 30.0f };
+        mpJoinBtn = SDL_FRect{ centerX + 10.0f, 270.0f, 140.0f, 30.0f };
+        mpBackBtn = SDL_FRect{ centerX - 60.0f, 320.0f, 120.0f, 26.0f };
 
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 140);
         SDL_RenderFillRect(renderer, &mpNameBox);
         SDL_RenderFillRect(renderer, &mpIpBox);
+        SDL_RenderFillRect(renderer, &mpColorBox);
 
         SDL_SetRenderDrawColor(renderer, mpNameActive ? 255 : 140, mpNameActive ? 255 : 140, mpNameActive ? 255 : 140, 255);
         SDL_RenderRect(renderer, &mpNameBox);
         SDL_SetRenderDrawColor(renderer, mpIpActive ? 255 : 140, mpIpActive ? 255 : 140, mpIpActive ? 255 : 140, 255);
         SDL_RenderRect(renderer, &mpIpBox);
 
-        RenderLabelScaled("Name", mpNameBox.x - 70.0f, mpNameBox.y + 8.0f, mpScale);
-        RenderLabelScaled("Join IP", mpIpBox.x - 90.0f, mpIpBox.y + 8.0f, mpScale);
+        RenderLabelScaled("Name", 30.0f, mpNameBox.y + 8.0f, mpScale);
+        RenderLabelScaled("Join IP", 24.0f, mpIpBox.y + 8.0f, mpScale);
+        RenderLabelScaled("Color", 30.0f, mpColorBox.y + 8.0f, mpScale);
         RenderLabelScaled(mpUserName, mpNameBox.x + 8.0f, mpNameBox.y + 10.0f, mpScale);
         RenderLabelScaled(mpHostIp, mpIpBox.x + 8.0f, mpIpBox.y + 10.0f, mpScale);
+        RenderLabelColoredScaled(kMpColors[mpColorIndex].name, mpColorBox.x + 8.0f, mpColorBox.y + 10.0f, mpScale, kMpColors[mpColorIndex].color);
 
         SDL_SetRenderDrawColor(renderer, 30, 30, 30, 200);
         SDL_RenderFillRect(renderer, &mpHostBtn);
@@ -3461,13 +3554,13 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         RenderLabelScaled("JOIN", mpJoinBtn.x + 44.0f, mpJoinBtn.y + 6.0f, mpScale);
         RenderLabelScaled("BACK", mpBackBtn.x + 38.0f, mpBackBtn.y + 5.0f, mpScale);
 
-        float listY = 320.0f;
-        RenderLabelScaled("Saved IPs", centerX - 80.0f, listY, mpScale);
+        float listY = 360.0f;
+        RenderLabelScaled("Saved IPs", 40.0f, listY, mpScale);
         listY += 26.0f;
         int idx = 0;
         for (const auto &ip : mpSavedIps) {
             if (idx >= 5) break;
-            mpSavedBoxes[idx] = SDL_FRect{ centerX - 120.0f, listY, 240.0f, 22.0f };
+            mpSavedBoxes[idx] = SDL_FRect{ 40.0f, listY, 220.0f, 22.0f };
             SDL_SetRenderDrawColor(renderer, 20, 20, 20, 180);
             SDL_RenderFillRect(renderer, &mpSavedBoxes[idx]);
             RenderLabelScaled(ip, mpSavedBoxes[idx].x + 6.0f, mpSavedBoxes[idx].y + 3.0f, mpScale);
@@ -3482,6 +3575,32 @@ SDL_AppResult SDL_AppIterate(void *appstate)
             RenderLabelScaled(netIsHost ? "Waiting for players..." : "Connecting...", centerX - 150.0f, 430.0f, mpScale);
         }
         RenderLabelScaled("Your IP (share): " + mpLocalIp, centerX - 150.0f, 460.0f, mpScale);
+
+        if (mpColorOpen) {
+            float optY = mpColorBox.y - 4.0f - 22.0f * (float)(sizeof(kMpColors) / sizeof(kMpColors[0]));
+            for (int i = 0; i < (int)(sizeof(kMpColors) / sizeof(kMpColors[0])); ++i) {
+                SDL_FRect optBox{ mpColorBox.x, optY, mpColorBox.w, 20.0f };
+                SDL_SetRenderDrawColor(renderer, 20, 20, 20, 200);
+                SDL_RenderFillRect(renderer, &optBox);
+                RenderLabelColoredScaled(kMpColors[i].name, optBox.x + 6.0f, optBox.y + 2.0f, mpScale, kMpColors[i].color);
+                optY += 22.0f;
+            }
+        }
+
+        // preview bird + name
+        flyingAnim.Update(dt);
+        SDL_Texture *preview = flyingAnim.Current();
+        if (!preview) preview = runningAnim.Current();
+        if (preview) {
+            SDL_Color col = kMpColors[mpColorIndex].color;
+            SDL_SetTextureColorMod(preview, col.r, col.g, col.b);
+            float px = 390.0f;
+            float py = 140.0f;
+            SDL_FRect dst{ px, py, 48.0f, 48.0f };
+            SDL_RenderTextureRotated(renderer, preview, nullptr, &dst, 0.0, nullptr, SDL_FLIP_NONE);
+            SDL_SetTextureColorMod(preview, 255, 255, 255);
+            RenderLabelScaled(mpUserName, px - 12.0f, py - 18.0f, mpScale);
+        }
     }
 
     // Options with volume sliders
@@ -3742,3 +3861,4 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result)
     TTF_Quit();
     SDL_Quit();
 }
+
